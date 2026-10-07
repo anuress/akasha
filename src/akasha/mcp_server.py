@@ -488,8 +488,8 @@ def _strip_titles(node):
             _strip_titles(item)
 
 
-INSTRUCTIONS = ("Shared knowledge base for coding agents. Search before investigating; "
-                "write findings back so other agents can reuse them.")
+INSTRUCTIONS = ("The user's local knowledge base. Search before investigating; "
+                "write findings back so later sessions can reuse them.")
 
 
 def build_server():

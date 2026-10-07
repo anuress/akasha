@@ -2,7 +2,7 @@
 name = "akasha-mcp"
 version = "0.0.1"
 requires-python = ">=3.11"
-description = "Shared knowledge base for coding agents, served over MCP."
+description = "A personal, local knowledge base for your coding agents, served over MCP."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

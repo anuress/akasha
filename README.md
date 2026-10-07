@@ -11,7 +11,7 @@ lived in a context window, and the window is gone. Today another agent meets the
 flake, reads the same files and derives the same answer, spending the same time and
 context to get there.
 
-What your team knows is not missing, it is scattered. Some of it sits in Claude Code
+What you already know is not missing, it is scattered. Some of it sits in Claude Code
 project memory, some in Serena memories, some in a notes folder, some in markdown files
 inside repos. Each agent writes to its own corner, and none of them searches the others.
 Pasting notes into prompts does not scale: context is the scarce resource, and every
