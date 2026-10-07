@@ -33,11 +33,13 @@ capped hits, with `knowledge_get` to page into a document only when one is worth
 
 Conventions are documents of `kind=convention`. They are delivered automatically at
 session start and are read-only to agents; only the CLI can create or change one. Hooks
-keep the index fresh without anyone thinking about it: a session-start hook refreshes it
-in the background, and a post-tool hook reindexes a note the moment an agent edits it.
+keep the index fresh without anyone thinking about it (in Claude Code and Gemini CLI): a
+session-start hook refreshes it in the background, and a post-tool hook reindexes a note
+the moment an agent edits it.
 
-Safety is enforced where the data enters. Secrets are redacted and prompt-injection text
-is neutralised at index time, so neither reaches an agent. Destructive operations are
+Safety is enforced where the data enters. At index time, secret-shaped strings are
+redacted and known prompt-injection patterns are neutralised before any agent sees the
+text. Both are pattern-based: they catch the common shapes, not every secret. Destructive operations are
 CLI-only; an agent can archive a document, never delete one. There is no account and no
 server, and nothing leaves your machine (the one exception is a small embedding model,
 downloaded once if dense search is on).
