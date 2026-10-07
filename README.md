@@ -1,14 +1,51 @@
 # akasha
 
-A local knowledge base for coding agents, served over MCP.
+A local knowledge base that gives coding agents a memory, served over MCP.
 
-Agents search it before investigating and write findings back, so the next session
-(or the next agent) does not start from zero. Markdown files on disk are the truth; a
-SQLite index derived from them is disposable. Search is keyword (BM25), plus optional
-dense retrieval.
+## The problem
 
-It has no account and no server: nothing leaves your machine. If you enable vector
-search, a small embedding model is downloaded once on first use.
+Every agent session starts from zero. Yesterday an agent spent an hour working out why a
+test fails one run in twenty: two tests share a fixture directory and the cleanup of one
+races the setup of the other. It fixed the test and the session ended. The reasoning
+lived in a context window, and the window is gone. Today another agent meets the same
+flake, reads the same files and derives the same answer, spending the same time and
+context to get there.
+
+What your team knows is not missing, it is scattered. Some of it sits in Claude Code
+project memory, some in Serena memories, some in a notes folder, some in markdown files
+inside repos. Each agent writes to its own corner, and none of them searches the others.
+Pasting notes into prompts does not scale: context is the scarce resource, and every
+pasted page crowds out the work. Conventions ("migrations are reviewed before merge",
+"never mock the database in integration tests") get retyped at the start of session
+after session.
+
+## How akasha fixes it
+
+akasha builds one local index over the markdown you already have. It is read-only by
+default and copies nothing: your files stay the source of truth, and the SQLite index
+derived from them can be deleted and rebuilt at any time.
+
+Agents search it through MCP before they start investigating, and write what they find
+back as ordinary markdown with `knowledge_write` and `knowledge_append`. The next
+session starts where the last one ended. Search is keyword (BM25) and, if enabled, dense
+retrieval, fused by reciprocal rank. Results are sized for a context window: a handful of
+capped hits, with `knowledge_get` to page into a document only when one is worth reading.
+
+Conventions are documents of `kind=convention`. They are delivered automatically at
+session start and are read-only to agents; only the CLI can create or change one. Hooks
+keep the index fresh without anyone thinking about it: a session-start hook refreshes it
+in the background, and a post-tool hook reindexes a note the moment an agent edits it.
+
+Safety is enforced where the data enters. Secrets are redacted and prompt-injection text
+is neutralised at index time, so neither reaches an agent. Destructive operations are
+CLI-only; an agent can archive a document, never delete one. There is no account and no
+server, and nothing leaves your machine (the one exception is a small embedding model,
+downloaded once if dense search is on).
+
+A day with akasha: an agent running in `claude` records the flaky-test cause with
+`knowledge_write`. The next morning an agent in `gemini` is asked about the same flake,
+calls `knowledge_search` first, and finds the finding in one hit instead of an hour of
+investigation.
 
 ## Requirements
 
@@ -67,7 +104,7 @@ akasha doctor                        # what is degraded; exit 0 means healthy
 
 Search defaults to the repo of the current checkout; `--all` searches every repo.
 
-## What agents get
+## Tools
 
 Eleven MCP tools:
 
@@ -85,6 +122,8 @@ Eleven MCP tools:
 | `feature_show` | How many documents carry a feature tag |
 | `doctor` | What is degraded about the installation |
 
+## Hooks
+
 Two hooks, both fail-open (they never block a session or a tool):
 
 - `akasha hook session-start` prints the repo's conventions, a short brief and an
@@ -96,7 +135,7 @@ Two hooks, both fail-open (they never block a session or a tool):
 Documents of `kind=convention` are standing rules: they are injected at session start and
 are read-only over MCP. Only the CLI can create or change one.
 
-## Sources
+## Sources and config
 
 The native knowledge directory (`~/.akasha/knowledge`) holds documents written through
 akasha. Everything else is an indexed root, one `[[index]]` block in `config.toml`:
@@ -129,7 +168,7 @@ Agents can only archive. Everything else is CLI-only.
 | `akasha knowledge restore ID` | Brings a trashed document back |
 | `akasha knowledge purge --yes` | Permanently deletes trashed documents (`--older-than DAYS` to limit) |
 
-## Rebuilding
+## Rebuilding and ids
 
 The database is derived from the files:
 
