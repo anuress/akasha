@@ -1,6 +1,6 @@
 # Working on akasha
 
-akasha is a personal, local knowledge base for one person's coding agents, served over MCP and a small CLI.
+akasha is a local knowledge base for coding agents, served over MCP and a small CLI.
 Its callers are agents, not people, so output size matters: context is the scarce
 resource, and every capability should be judged from the caller's side.
 

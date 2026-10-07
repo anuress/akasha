@@ -502,7 +502,7 @@ def cmd_housekeeping(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="akasha",
-        description="A personal, local knowledge base for your coding agents.",
+        description="A local knowledge base for your coding agents.",
         epilog=(
             "examples:\n"
             "  akasha knowledge search \"cache expiry\" --limit 3\n"

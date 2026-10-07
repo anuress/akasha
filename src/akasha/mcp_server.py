@@ -488,7 +488,7 @@ def _strip_titles(node):
             _strip_titles(item)
 
 
-INSTRUCTIONS = ("The user's local knowledge base. Search before investigating; "
+INSTRUCTIONS = ("Local knowledge base. Search before investigating; "
                 "write findings back so later sessions can reuse them.")
 
 
