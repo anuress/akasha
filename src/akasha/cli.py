@@ -59,7 +59,7 @@ def cmd_init(args) -> int:
             print('dense search: on ([embeddings] provider = "model2vec")')
         else:
             print("dense search is off: the vectors extra isn't installed; "
-                  "reinstall with `uv tool install --force 'akasha-mcp[vectors]'`")
+                  "reinstall with `uv tool install --force --python 3.12 'akasha-mcp[vectors]'`")
         if args.dry_run:
             print("[dry-run] would write config.toml; nothing created")
         else:

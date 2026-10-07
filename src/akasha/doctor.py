@@ -86,7 +86,7 @@ def _vectors(cfg: Config, conn: sqlite3.Connection) -> Finding:
     if missing:
         return Finding("vectors", "error",
                        f"extra not installed ({', '.join(missing)} missing); search is "
-                       "lexical only. Reinstall with `uv tool install --force "
+                       "lexical only. Reinstall with `uv tool install --force --python 3.12 "
                        "'akasha-mcp[vectors]'`")
     if not vectors.available(conn):
         return Finding("vectors", "error", "sqlite-vec did not load; search is lexical only")

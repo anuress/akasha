@@ -61,13 +61,15 @@ investigation.
 The PyPI package is `akasha-mcp`; the command it installs is `akasha`.
 
 ```sh
-uv tool install 'akasha-mcp[vectors]'
+uv tool install --python 3.12 'akasha-mcp[vectors]'
 ```
 
-Without dense search: `uv tool install akasha-mcp`. From git:
+`--python` matters when your default Python is older than 3.11 (macOS ships 3.9): uv does
+not pick an interpreter from the package's requirement on its own, and downloads 3.12 if
+you don't have it. Without dense search: `uv tool install --python 3.12 akasha-mcp`. From git:
 
 ```sh
-uv tool install 'akasha-mcp[vectors] @ git+https://github.com/anuress/akasha'
+uv tool install --python 3.12 'akasha-mcp[vectors] @ git+https://github.com/anuress/akasha'
 ```
 
 With `[vectors]` installed, `akasha init` writes `provider = "model2vec"` and search is
