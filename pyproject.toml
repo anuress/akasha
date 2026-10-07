@@ -1,0 +1,58 @@
+[project]
+name = "akasha-mcp"
+version = "0.0.1"
+requires-python = ">=3.11"
+description = "Shared knowledge base for coding agents, served over MCP."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ahmad Nur Salim" }]
+keywords = ["mcp", "knowledge-base", "coding-agents", "claude-code"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: OS Independent",
+]
+# Ceiling on the major: mcp 2.0 removed the 1.x decorators. An unbounded floor lets a
+# future major silently break `akasha serve`.
+dependencies = ["mcp>=2.0,<3"]
+
+[project.urls]
+Homepage = "https://github.com/anuress/akasha"
+Repository = "https://github.com/anuress/akasha"
+
+[project.scripts]
+akasha = "akasha.cli:main"
+
+[project.optional-dependencies]
+# Dense retrieval. Optional: akasha searches lexically without it.
+vectors = ["sqlite-vec>=0.1.9", "model2vec>=0.6", "numpy>=1.24"]
+# pytest lives here for `uv run --extra dev ...` compatibility, and in the dev
+# dependency-group below so `uv run` syncs it via default-groups.
+dev = ["pytest>=8.0"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "sqlite-vec>=0.1.9",
+    "model2vec>=0.6",
+    "numpy>=1.24",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/akasha"]
+
+# Tests ship so downstream packagers can run them; agent instructions, CI files and the
+# lockfile do not belong in a release.
+[tool.hatch.build.targets.sdist]
+include = ["src/akasha", "tests", "scripts/bench-retrieval.py", "README.md", "LICENSE"]
