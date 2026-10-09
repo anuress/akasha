@@ -3,7 +3,8 @@ import os
 
 import pytest
 
-from akasha.install import (HOOK_COMMAND, INSTALLED_HOOK_COMMAND, allow_akasha_tools,
+from akasha.install import (HOOK_COMMAND, INSTALLED_HOOK_COMMAND, VENDORS,
+                            allow_akasha_tools,
                             hook_vendors, install_hooks, post_tool_hook_command,
                             session_hook_command)
 
@@ -38,14 +39,17 @@ def test_session_start_and_post_tool_are_the_only_hooks(tmp_path):
     assert "pre-tool" not in json.dumps(_hooks(tmp_path))
 
 
-def test_post_tool_runs_only_for_file_writing_tools(tmp_path):
-    """A process per Read or Bash call would cost more than the reindex is worth."""
+def test_post_tool_runs_only_for_file_writing_and_recording_tools(tmp_path):
+    """A process per Read or Bash call would cost more than the reindex is worth. The
+    recording tools are matched so the write nudge sees a session record something;
+    Gemini names MCP tools mcp_<server>_<tool>, Claude mcp__<server>__<tool>."""
     install_hooks("claude", tmp_path)
     install_hooks("gemini", tmp_path)
     claude = _hooks(tmp_path)["PostToolUse"][0]
     gemini = _hooks(tmp_path, "gemini")["AfterTool"][0]
-    assert claude["matcher"] == "Write|Edit|MultiEdit"
-    assert gemini["matcher"] == "write_file|replace"
+    assert claude["matcher"] == (
+        "Write|Edit|MultiEdit|mcp__akasha__knowledge_(write|append|update)")
+    assert gemini["matcher"] == "write_file|replace|mcp_akasha_knowledge_(write|append|update)"
     assert claude["hooks"][0]["command"] == POST
 
 
@@ -113,12 +117,14 @@ def test_the_upgrade_keeps_extra_arguments_after_the_exact_command(tmp_path):
 
 
 def test_a_stale_post_tool_matcher_on_akashas_entry_is_upgraded(tmp_path):
-    """A matcher that misses Edit and MultiEdit leaves edits unindexed."""
+    """A matcher that misses Edit and MultiEdit leaves edits unindexed; one that misses
+    the recording tools leaves the write nudge blind to writes."""
     _seed(tmp_path, {"hooks": {"PostToolUse": [{"matcher": "Write", "hooks": [
         {"type": "command", "command": POST}]}]}})
     install_hooks("claude", tmp_path)
     entries = _hooks(tmp_path)["PostToolUse"]
-    assert len(entries) == 1 and entries[0]["matcher"] == "Write|Edit|MultiEdit"
+    assert len(entries) == 1
+    assert entries[0]["matcher"] == VENDORS["claude"].write_matcher
 
 
 def test_a_matcher_shared_with_someone_elses_hook_is_left_alone(tmp_path):

@@ -401,7 +401,12 @@ def cmd_hook(args) -> int:
     # A hook must never block the agent's session, whatever the payload or the machine.
     try:
         if args.event == "post-tool":
-            return hooks.run_post_tool(sys.stdin.read())
+            stdin_text = sys.stdin.read()
+            hooks.run_post_tool(stdin_text)
+            reply = hooks.post_tool_output(stdin_text)
+            if reply:
+                print(reply)
+            return 0
         code, text = hooks.run_session_start(
             Path.cwd(), repo=args.repo, defer_refresh=args.defer_refresh,
             refresh_only=args.refresh_only)
@@ -684,7 +689,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("hook", help="agent hook entrypoint; post-tool reads a JSON payload on stdin")
     p.add_argument("event", choices=["session-start", "post-tool"],
-                   help="session-start prints a brief; post-tool reindexes the file just written")
+                   help="session-start prints a brief; post-tool reindexes the file just written "
+                        "and may print a write nudge")
     p.add_argument("--repo", help="session-start: repo the session is in; derived from the checkout if unset")
     p.add_argument("--defer-refresh", action="store_true",
                    help="session-start: reply without waiting for the index walk")

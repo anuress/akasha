@@ -23,9 +23,10 @@ from akasha.config import Config
 from akasha.db import SCHEMA_VERSION
 from akasha.fsck import cached_error_count
 from akasha.hooks import conventions_over_budget
-from akasha.install import (INSTALLED_HOOK_COMMAND, ConfigError, detect_vendors,
+from akasha.install import (INSTALLED_HOOK_COMMAND, VENDORS, ConfigError, detect_vendors,
                             hook_vendors, mcp_problem, mcp_registered,
-                            post_tool_hook_command, session_hook_command)
+                            post_tool_hook_command, post_tool_matcher,
+                            session_hook_command)
 
 
 @dataclass
@@ -144,6 +145,11 @@ def _integrations(home: Path) -> list[Finding]:
                 "hook", "note",
                 f"{vendor}: post-tool hook not installed, so edits are indexed only at the "
                 "next session start; run `akasha init`"))
+        elif post_tool_matcher(vendor, home) != VENDORS[vendor].write_matcher:
+            findings.append(Finding(
+                "hook", "note",
+                f"{vendor}: post-tool hook matcher is out of date, so the write nudge cannot "
+                "see what a session records; run `akasha init`"))
     return findings
 
 

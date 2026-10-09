@@ -113,3 +113,20 @@ def test_post_tool_fails_open_on_any_payload(home, monkeypatch, capsys, payload)
     _stdin(monkeypatch, payload)
     assert main(["hook", "post-tool"]) == 0
     assert capsys.readouterr().out == ""
+
+
+def test_post_tool_prints_the_nudge_as_hook_json_on_the_threshold_edit(home, monkeypatch,
+                                                                        capsys):
+    """Claude and Gemini read additionalContext from hookSpecificOutput on stdout."""
+    from akasha.hooks import NUDGE_EDITS
+
+    payload = {"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": "Edit",
+               "tool_input": {"file_path": str(home / "main.py")}}
+    outs = []
+    for _ in range(NUDGE_EDITS):
+        _stdin(monkeypatch, payload)
+        assert main(["hook", "post-tool"]) == 0
+        outs.append(capsys.readouterr().out)
+    assert outs[:-1] == [""] * (NUDGE_EDITS - 1)
+    reply = json.loads(outs[-1])["hookSpecificOutput"]
+    assert reply["hookEventName"] == "PostToolUse" and reply["additionalContext"]

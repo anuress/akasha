@@ -26,10 +26,12 @@ def test_brief_points_at_the_tools_even_on_an_empty_base(env):
     assert "knowledge_search" in hooks.session_brief(conn)
 
 
-def test_brief_stays_short_and_one_line(env):
+def test_brief_stays_one_line_and_bounded(env):
+    """It is sent every session. The bound leaves room for the list of what to record:
+    a vague "worth keeping" was measured to produce few writes."""
     conn, cfg, _ = env
     brief = hooks.session_brief(conn)
-    assert "\n" not in brief and len(brief) < 300
+    assert "\n" not in brief and len(brief) < 600
 
 
 def test_brief_names_the_search_and_write_tools(env):
@@ -37,6 +39,19 @@ def test_brief_names_the_search_and_write_tools(env):
     brief = hooks.session_brief(conn)
     assert "knowledge_search before investigating" in brief
     assert "knowledge_write" in brief
+
+
+def test_brief_asks_for_writes_without_waiting_to_be_asked(env):
+    """Agents treated writing as something to do on request; the brief says otherwise."""
+    conn, cfg, _ = env
+    assert "without being asked" in hooks.session_brief(conn).lower()
+
+
+def test_brief_routes_a_new_rule_through_the_user(env):
+    """Agents cannot create conventions; without this the agent tries, is refused, and
+    may drop the rule instead of recording it."""
+    conn, cfg, _ = env
+    assert "convention" in hooks.session_brief(conn)
 
 
 def test_integrity_note_reads_the_cached_count_and_runs_no_fsck(env, monkeypatch):

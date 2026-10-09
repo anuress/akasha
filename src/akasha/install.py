@@ -37,8 +37,9 @@ class Vendor:
     hook_file: tuple[str, ...] | None = None  # under HOME: settings holding hooks
     session_event: str = "SessionStart"
     post_event: str = "PostToolUse"
-    # Only tools that write a file: a process per Read or Bash call would cost more than
-    # the reindex is worth. Tool names are the vendor's own.
+    # Only tools that write a file, plus akasha's recording tools so the write nudge sees a
+    # session record something: a process per Read or Bash call would cost more than the
+    # reindex is worth. Tool names are the vendor's own.
     write_matcher: str = ""
 
 
@@ -48,14 +49,15 @@ VENDORS: dict[str, Vendor] = {
     "claude": Vendor(
         binary="claude", mcp_file=(".claude.json",), mcp_key="mcpServers",
         mcp_argv=("claude", "mcp", "add", "--scope", "user", "akasha", "--", "akasha", "serve"),
-        hook_file=(".claude", "settings.json"), write_matcher="Write|Edit|MultiEdit"),
+        hook_file=(".claude", "settings.json"),
+        write_matcher="Write|Edit|MultiEdit|mcp__akasha__knowledge_(write|append|update)"),
     # --trust is scoped to this server: without it every tool call needs confirmation.
     "gemini": Vendor(
         binary="gemini", mcp_file=(".gemini", "settings.json"), mcp_key="mcpServers",
         mcp_argv=("gemini", "mcp", "add", "--scope", "user", "--transport", "stdio", "--trust",
                   "--description", "akasha knowledge base", "akasha", "akasha", "serve"),
         hook_file=(".gemini", "settings.json"), post_event="AfterTool",
-        write_matcher="write_file|replace"),
+        write_matcher="write_file|replace|mcp_akasha_knowledge_(write|append|update)"),
     "copilot": Vendor(
         binary="copilot", mcp_file=(".copilot", "mcp-config.json"), mcp_key="mcpServers",
         mcp_entry=_FILE_ENTRY),
@@ -273,9 +275,9 @@ def install_hooks(vendor: str, home: Path | None = None, dry_run: bool = False) 
     return _save(path, data, "updated")
 
 
-def hook_command(vendor: str, event: str, home: Path | None = None) -> str | None:
-    """The akasha command installed for `event` ("session" or "post") under `vendor`, or
-    None when absent. Raises ConfigError when the settings cannot be read."""
+def _hook_entry(vendor: str, event: str, home: Path | None) -> tuple[dict, str] | None:
+    """(entry, command) of akasha's hook for `event` ("session" or "post") under `vendor`,
+    or None when absent. Raises ConfigError when the settings cannot be read."""
     spec = VENDORS.get(vendor)
     if spec is None or spec.hook_file is None:
         return None
@@ -287,8 +289,21 @@ def hook_command(vendor: str, event: str, home: Path | None = None) -> str | Non
         for hook in entry.get("hooks", []) if isinstance(entry, dict) else []:
             command = hook.get("command", "") if isinstance(hook, dict) else ""
             if isinstance(command, str) and command.startswith("akasha hook"):
-                return command
+                return entry, command
     return None
+
+
+def hook_command(vendor: str, event: str, home: Path | None = None) -> str | None:
+    """The akasha command installed for `event` ("session" or "post") under `vendor`, or
+    None when absent. Raises ConfigError when the settings cannot be read."""
+    found = _hook_entry(vendor, event, home)
+    return found[1] if found else None
+
+
+def post_tool_matcher(vendor: str, home: Path | None = None) -> str | None:
+    """The matcher on akasha's post-tool hook, or None when the hook is absent."""
+    found = _hook_entry(vendor, "post", home)
+    return found[0].get("matcher") if found else None
 
 
 def session_hook_command(vendor: str, home: Path | None = None) -> str | None:

@@ -488,8 +488,7 @@ def _strip_titles(node):
             _strip_titles(item)
 
 
-INSTRUCTIONS = ("Local knowledge base. Search before investigating; "
-                "write findings back so later sessions can reuse them.")
+INSTRUCTIONS = "Local knowledge base. Search before investigating; record findings unprompted."
 
 
 def build_server():

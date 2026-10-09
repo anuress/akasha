@@ -2,7 +2,8 @@
 
 Every vendor adapter shells out to `akasha hook <event>`, so the policy exists once, here.
 Two events: `session-start` (conventions, a short brief, an integrity note) and
-`post-tool` (reindex the one file a tool just wrote). Both fail open: a hook must never
+`post-tool` (reindex the one file a tool just wrote, and nudge a session that has edited
+for a while without recording anything). Both fail open: a hook must never
 stop a session or a tool.
 """
 from __future__ import annotations
@@ -10,9 +11,11 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from akasha.config import Config
@@ -130,8 +133,14 @@ def session_brief(conn: sqlite3.Connection) -> str:
     """Two sentences on how to use the knowledge base, plus an integrity note if needed.
     Never empty: a silent brief leaves the agent with no pointer to the tools."""
     note = _integrity_note(conn)
-    tools = ("akasha: call knowledge_search before investigating, not after; call "
-             "knowledge_write when you find something worth keeping.")
+    tools = ("akasha: call knowledge_search before investigating, not after. Without "
+             "being asked, record with knowledge_write or knowledge_append what you "
+             "learned that took effort to find and the code doesn't already say: how "
+             "something works or where it lives, a root cause and its fix, an approach "
+             "ruled out and why, a decision and its reason, a rule or convention, a "
+             "measurement, setup steps that worked, a gotcha, work left unfinished, or any "
+             "other new knowledge. If a document you read proved wrong, correct it. Record "
+             "a new rule as a normal document and ask the user to make it a convention.")
     return f"{tools} {note}." if note else tools
 
 
@@ -323,3 +332,64 @@ def run_post_tool(stdin_text: str, conn: sqlite3.Connection | None = None,
         if opened is not None:
             opened.close()
     return 0
+
+
+# --- write nudge ----------------------------------------------------------------------
+
+# Edits in a row with nothing recorded before the agent is reminded. Measured: long
+# sessions ran dozens of edits with no write, while short ones rarely reach this.
+NUDGE_EDITS = 15
+NUDGE = (f"akasha: {NUDGE_EDITS} edits since anything was recorded. Found a root cause, a "
+         "ruled-out approach, a decision, a gotcha or anything else new? Record it with "
+         "knowledge_write or knowledge_append now; otherwise carry on.")
+# A session's counter outlives no session by much; older files are abandoned sessions.
+NUDGE_STATE_DAYS = 2
+# Claude and pi name the tools mcp__akasha__<tool>, Gemini mcp_akasha_<tool>.
+_RECORDING = re.compile(r"^mcp__?akasha__?knowledge_(write|append|update)$")
+
+
+def _nudge_state_dir() -> Path:
+    from akasha.config import load_config
+
+    return load_config().db_path.parent / "sessions"
+
+
+def _prune_nudge_state(state_dir: Path) -> None:
+    cutoff = time.time() - NUDGE_STATE_DAYS * 86400
+    for old in state_dir.iterdir():
+        if old.stat().st_mtime < cutoff:
+            old.unlink(missing_ok=True)
+
+
+def post_tool_output(stdin_text: str, state_dir: Path | None = None) -> str:
+    """What `akasha hook post-tool` prints: hook JSON carrying the write nudge on the
+    edit that reaches NUDGE_EDITS with nothing recorded, else nothing.
+
+    The count lives in one small file per session, not the database: it is not
+    knowledge, and an edit to a source file must not open the database. Fails open.
+    """
+    try:
+        payload = json.loads(stdin_text) if stdin_text.strip() else None
+        session = payload.get("session_id") if isinstance(payload, dict) else None
+        if not isinstance(session, str) or not session:
+            return ""
+        state_dir = state_dir or _nudge_state_dir()
+        # The id names a file; anything but these characters could leave the directory.
+        state = state_dir / re.sub(r"[^A-Za-z0-9_-]", "_", session)[:128]
+        if _RECORDING.match(str(payload.get("tool_name", ""))):
+            state.unlink(missing_ok=True)
+            return ""
+        if not state.exists():
+            state_dir.mkdir(parents=True, exist_ok=True)
+            _prune_nudge_state(state_dir)
+        # ponytail: read-modify-write without a lock; parallel edits in one session can
+        # lose a count, which only delays the nudge.
+        edits = (int(state.read_text() or 0) if state.exists() else 0) + 1
+        state.write_text(str(edits))
+        if edits != NUDGE_EDITS:
+            return ""
+        return json.dumps({"hookSpecificOutput": {
+            "hookEventName": payload.get("hook_event_name") or "PostToolUse",
+            "additionalContext": NUDGE}})
+    except Exception:                                                    # noqa: BLE001
+        return ""

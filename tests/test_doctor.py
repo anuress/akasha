@@ -215,6 +215,21 @@ def test_a_hook_without_defer_refresh_is_an_error(env, monkeypatch):
                for f in findings)
 
 
+def test_a_post_tool_hook_blind_to_recording_tools_is_a_note(env, monkeypatch):
+    """An install from before the write nudge still reindexes edits, but never sees a
+    write, so it would nudge sessions that did record something."""
+    _, _, home = env
+    monkeypatch.setattr("akasha.doctor.detect_vendors", lambda: ["claude"])
+    install.install_hooks("claude", home)
+    path = home / ".claude" / "settings.json"
+    data = json.loads(path.read_text())
+    data["hooks"]["PostToolUse"][0]["matcher"] = "Write|Edit|MultiEdit"
+    path.write_text(json.dumps(data))
+    notes = [f for f in _run(env) if f.kind == "hook"]
+    assert len(notes) == 1 and notes[0].severity == "note"
+    assert "akasha init" in notes[0].detail
+
+
 def test_missing_hooks_are_notes(env, monkeypatch):
     monkeypatch.setattr("akasha.doctor.detect_vendors", lambda: ["gemini"])
     notes = [f for f in _run(env) if f.kind == "hook"]

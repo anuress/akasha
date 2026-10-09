@@ -135,6 +135,9 @@ Two hooks, both fail-open (they never block a session or a tool):
   so it does not wait for an index walk.
 - `akasha hook post-tool` reads the tool payload on stdin and reindexes the one file an
   agent just wrote, if it is inside an index root.
+  After 15 edits in a session with nothing recorded through `knowledge_write`,
+  `knowledge_append` or `knowledge_update`, it prints a one-time reminder to record what
+  was learned; the count restarts at the next write.
 
 Documents of `kind=convention` are standing rules: they are injected at session start and
 are read-only over MCP. Only the CLI can create or change one.

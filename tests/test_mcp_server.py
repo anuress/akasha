@@ -131,10 +131,11 @@ def test_list_tools_defaults_are_the_trimmed_ones():
     assert props["knowledge_timeline"]["limit"]["default"] == 15
 
 
-def test_server_instructions_tell_agents_to_search_first_and_write_back():
+def test_server_instructions_tell_agents_to_search_first_and_record_unprompted():
     server = mcp_server.build_server()
     text = server.instructions.lower()
-    assert "search" in text and "write" in text and len(text) < 300
+    assert "search" in text and "record" in text and "unprompted" in text
+    assert len(text) < 300
 
 
 # --- retrieval -------------------------------------------------------------------------
