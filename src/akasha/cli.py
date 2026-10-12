@@ -690,7 +690,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("hook", help="agent hook entrypoint; post-tool reads a JSON payload on stdin")
     p.add_argument("event", choices=["session-start", "post-tool"],
                    help="session-start prints a brief; post-tool reindexes the file just written "
-                        "and may print a write nudge")
+                        "and may print a write nudge and the gotchas scoped to that file")
     p.add_argument("--repo", help="session-start: repo the session is in; derived from the checkout if unset")
     p.add_argument("--defer-refresh", action="store_true",
                    help="session-start: reply without waiting for the index walk")

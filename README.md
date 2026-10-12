@@ -138,6 +138,12 @@ Two hooks, both fail-open (they never block a session or a tool):
   After 15 edits in a session with nothing recorded through `knowledge_write`,
   `knowledge_append` or `knowledge_update`, it prints a one-time reminder to record what
   was learned; the count restarts at the next write.
+  It also prints the `kind=gotcha` documents scoped to the file, as context after the
+  edit (advisory; never blocks). A gotcha opts in with frontmatter `paths: [globs]`,
+  matched against the path relative to the file's checkout (`*` stays in one directory,
+  `**` crosses them; braces are not supported), and may add `pattern: <regex>`, which
+  must match the new text (keep it simple; only the first 200,000 characters are scanned).
+  Repo-scoped and `default` gotchas apply; each is shown once per session per file.
 
 Documents of `kind=convention` are standing rules: they are injected at session start and
 are read-only over MCP. Only the CLI can create or change one.

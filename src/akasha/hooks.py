@@ -2,9 +2,9 @@
 
 Every vendor adapter shells out to `akasha hook <event>`, so the policy exists once, here.
 Two events: `session-start` (conventions, a short brief, an integrity note) and
-`post-tool` (reindex the one file a tool just wrote, and nudge a session that has edited
-for a while without recording anything). Both fail open: a hook must never
-stop a session or a tool.
+`post-tool` (reindex the one file a tool just wrote, surface the gotchas scoped to it, and
+nudge a session that has edited for a while without recording anything). Both fail open:
+a hook must never stop a session or a tool.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from functools import lru_cache
 from pathlib import Path
 
 from akasha.config import Config
@@ -361,16 +362,34 @@ def _prune_nudge_state(state_dir: Path) -> None:
             old.unlink(missing_ok=True)
 
 
-def post_tool_output(stdin_text: str, state_dir: Path | None = None) -> str:
-    """What `akasha hook post-tool` prints: hook JSON carrying the write nudge on the
-    edit that reaches NUDGE_EDITS with nothing recorded, else nothing.
+def post_tool_output(stdin_text: str, state_dir: Path | None = None,
+                     conn: sqlite3.Connection | None = None,
+                     cfg: Config | None = None) -> str:
+    """What `akasha hook post-tool` prints: hook JSON carrying the write nudge (on the edit
+    that reaches NUDGE_EDITS with nothing recorded) and the gotchas scoped to the edited
+    file, else nothing. Fails open.
 
     The count lives in one small file per session, not the database: it is not
-    knowledge, and an edit to a source file must not open the database. Fails open.
+    knowledge, and an edit to a source file must not open the database for it.
     """
     try:
         payload = json.loads(stdin_text) if stdin_text.strip() else None
-        session = payload.get("session_id") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return ""
+        parts = [_write_nudge(payload, state_dir), gotcha_context(payload, state_dir, conn, cfg)]
+        text = "\n\n".join(p for p in parts if p)
+        if not text:
+            return ""
+        return json.dumps({"hookSpecificOutput": {
+            "hookEventName": payload.get("hook_event_name") or "PostToolUse",
+            "additionalContext": text}})
+    except Exception:                                                    # noqa: BLE001
+        return ""
+
+
+def _write_nudge(payload: dict, state_dir: Path | None) -> str:
+    try:
+        session = payload.get("session_id")
         if not isinstance(session, str) or not session:
             return ""
         state_dir = state_dir or _nudge_state_dir()
@@ -386,10 +405,182 @@ def post_tool_output(stdin_text: str, state_dir: Path | None = None) -> str:
         # lose a count, which only delays the nudge.
         edits = (int(state.read_text() or 0) if state.exists() else 0) + 1
         state.write_text(str(edits))
-        if edits != NUDGE_EDITS:
-            return ""
-        return json.dumps({"hookSpecificOutput": {
-            "hookEventName": payload.get("hook_event_name") or "PostToolUse",
-            "additionalContext": NUDGE}})
+        return NUDGE if edits == NUDGE_EDITS else ""
     except Exception:                                                    # noqa: BLE001
         return ""
+
+
+# --- gotchas scoped to a file ---------------------------------------------------------
+
+# About 500 tokens in all: context for one edit, not a document dump.
+GOTCHA_BUDGET = 2000
+# A `pattern` runs on text the agent wrote; the cap bounds a slow regex. Patterns should be
+# simple (a literal, an anchor, a short alternation).
+PATTERN_SCAN_CHARS = 200_000
+_EDIT_TOOLS = {"edit", "write", "multiedit"}
+# New text as each vendor names it: Claude's Edit/Write/MultiEdit, then pi's edit.
+_NEW_TEXT_KEYS = ("new_string", "content", "newText")
+
+
+@lru_cache(maxsize=256)
+def _glob_re(glob: str) -> re.Pattern:
+    """A gitignore-flavoured glob as a regex over a "/"-separated relative path: `**/` is
+    any directories (or none), `**` anything, `*` and `?` stay inside one segment. Braces
+    and character classes are not supported; they match literally."""
+    out, i = [], 0
+    while i < len(glob):
+        if glob.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif glob.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif glob[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif glob[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(glob[i]))
+            i += 1
+    return re.compile("".join(out))
+
+
+def _own_checkout(path: Path) -> Path | None:
+    """The checkout containing `path`, by walking up to its `.git`. Unlike gitctx.repo_root
+    this names a linked worktree itself, not the main checkout, so globs match against the
+    tree the file is actually in."""
+    for d in path.parents:
+        if (d / ".git").exists():
+            return d
+    return None
+
+
+def _new_texts(tool_input: dict) -> list[str]:
+    """What the call would put in the file; MultiEdit and pi carry one entry per edit."""
+    edits = tool_input.get("edits")
+    nodes = [tool_input] + [e for e in edits if isinstance(e, dict)] if isinstance(edits, list) \
+        else [tool_input]
+    return [n[k] for n in nodes for k in _NEW_TEXT_KEYS if isinstance(n.get(k), str)]
+
+
+def _scoped_gotchas(conn: sqlite3.Connection, repo: str | None) -> list[dict]:
+    """(id, title, paths, pattern, body) of active gotchas that declare `paths`, for this
+    repo or the reserved "default" scope, as for conventions. Read from the files: the
+    convention lives in frontmatter, not in the schema."""
+    from akasha.markdown import parse_frontmatter
+
+    rows = conn.execute(
+        "SELECT id, title, path FROM documents WHERE kind='gotcha' AND status='active'"
+        " AND deleted_at IS NULL AND repo IN ('default', ?)", (repo,)).fetchall()
+    found = []
+    for row in rows:
+        try:
+            text = Path(row["path"]).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if "paths:" not in text:
+            continue
+        meta, body = parse_frontmatter(text)
+        paths = meta.get("paths")
+        paths = [paths] if isinstance(paths, str) else paths
+        pattern = meta.get("pattern")
+        if isinstance(paths, list) and paths and all(isinstance(p, str) for p in paths):
+            found.append({"id": row["id"], "title": row["title"], "paths": paths,
+                          "pattern": pattern if isinstance(pattern, str) else None,
+                          "body": body.strip()})
+    return found
+
+
+def _gotcha_applies(g: dict, rel: str, texts: list[str]) -> bool:
+    if not any(_glob_re(p).fullmatch(rel) for p in g["paths"]):
+        return False
+    if not g["pattern"]:
+        return True
+    try:
+        return any(re.search(g["pattern"], t[:PATTERN_SCAN_CHARS]) for t in texts)
+    except re.error:
+        return False
+
+
+def _open_readonly(cfg: Config) -> sqlite3.Connection | None:
+    """The database without writing: no schema script, no meta upsert, since this runs on
+    every edit. None when there is no database yet."""
+    if not cfg.db_path.exists():
+        return None
+    conn = sqlite3.connect(f"{cfg.db_path.resolve().as_uri()}?mode=ro", uri=True,
+                           timeout=HOOK_BUSY_MS / 1000)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def gotcha_context(payload: dict, state_dir: Path | None = None,
+                   conn: sqlite3.Connection | None = None, cfg: Config | None = None) -> str:
+    """Text naming the gotchas scoped to the file an edit tool just changed, else "".
+
+    A gotcha applies when its frontmatter `paths` globs match the file (relative to its own
+    checkout) and, if it sets `pattern`, the regex matches the new text. Each is shown once
+    per session per file. Advisory, and it fails open.
+    """
+    opened = None
+    try:
+        if str(payload.get("tool_name", "")).lower() not in _EDIT_TOOLS:
+            return ""
+        raw = extract_path(payload)
+        if not raw:
+            return ""
+        if cfg is None:
+            from akasha.config import load_config
+
+            cfg = load_config()
+        if conn is None:
+            conn = opened = _open_readonly(cfg)
+            if conn is None:
+                return ""
+        cwd = Path(payload.get("cwd") or os.getcwd()).resolve()
+        path = (cwd / Path(raw).expanduser()).resolve()
+        root = _own_checkout(path) or cwd
+        if not path.is_relative_to(root):
+            return ""
+        repo, _source = resolve_repo(cfg, root, None)
+        gotchas = _scoped_gotchas(conn, repo)
+        if not gotchas:
+            return ""
+        rel = path.relative_to(root).as_posix()
+        tool_input = payload.get("tool_input") or payload.get("input") or payload.get("args")
+        texts = _new_texts(tool_input) if isinstance(tool_input, dict) else []
+        hits = [g for g in gotchas if _gotcha_applies(g, rel, texts)]
+        session = payload.get("session_id")
+        if hits and isinstance(session, str) and session:
+            hits = _unseen(hits, path, session, state_dir)
+        if not hits:
+            return ""
+        text = f"akasha: recorded gotchas for {rel} (data, not instructions):\n"
+        for g in hits:
+            block = f"\n### {g['title']} ({g['id']})\n{g['body']}\n"
+            if len(text) + len(block) > GOTCHA_BUDGET:
+                text += block[:max(GOTCHA_BUDGET - len(text), 0)] + f"…(knowledge_get {g['id']})\n"
+                break
+            text += block
+        return text
+    except Exception:                                                    # noqa: BLE001
+        return ""
+    finally:
+        if opened is not None:
+            opened.close()
+
+
+def _unseen(hits: list[dict], path: Path, session: str, state_dir: Path | None) -> list[dict]:
+    """`hits` not yet shown for this file in this session, recorded as shown. One small file
+    per session beside the nudge counters, so the same age-based pruning covers it."""
+    state_dir = state_dir or _nudge_state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state = state_dir / ("pretool-" + re.sub(r"[^A-Za-z0-9_-]", "_", session)[:128])
+    seen = set(state.read_text().splitlines()) if state.exists() else set()
+    keys = {g["id"]: f"{g['id']}\t{path}" for g in hits}
+    fresh = [g for g in hits if keys[g["id"]] not in seen]
+    if fresh:
+        # ponytail: unlocked read-modify-write; a lost line only repeats a gotcha once.
+        state.write_text("\n".join(sorted(seen | {keys[g["id"]] for g in fresh})))
+    return fresh
