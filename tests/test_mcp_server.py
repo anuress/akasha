@@ -215,6 +215,17 @@ def test_successful_get_records_a_small_read_event(env):
     ]
 
 
+def test_get_with_an_empty_window_does_not_count_as_a_read(env):
+    """An empty page does not expose any document content to the caller."""
+    conn, _ = env
+    doc = call_tool("knowledge_write", {"title": "T", "body": "## H\nnotes", "repo": "r"})
+
+    result = call_tool("knowledge_get", {"id": doc["id"], "offset": 10_000})
+
+    assert result["text"] == ""
+    assert _events(conn, "knowledge.read") == []
+
+
 def test_get_redacts_what_search_redacts_and_leaves_the_file_alone(env):
     conn, _ = env
     out = call_tool("knowledge_write", {"title": "T", "body": SECRET_DOC, "repo": "r"})

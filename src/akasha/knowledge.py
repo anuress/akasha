@@ -359,7 +359,8 @@ def _display_error(error_text: str) -> str:
     return re.sub(r"(?<![^\s'\"(])/\S+", lambda m: m.group(0).rsplit("/", 1)[-1], error)
 
 def stats(conn: sqlite3.Connection, days: int = 30, limit: int = 20) -> dict:
-    """Retrieval quality, read from the `knowledge.searched` and `tool.failed` events.
+    """Retrieval quality, read from `knowledge.searched`, `knowledge.read`, and
+    `tool.failed` events.
 
     Answers what share of searches came back empty, which surfaced documents nobody then
     opened, and which questions were asked more than once.
@@ -379,9 +380,18 @@ def stats(conn: sqlite3.Connection, days: int = 30, limit: int = 20) -> dict:
             continue
 
     zero_hits = sum(1 for p in searches if p.get("count") == 0)
-    read_count = conn.execute(
-        "SELECT COUNT(*) AS count FROM events WHERE kind='knowledge.read' AND ts >= ?",
-        (cutoff,)).fetchone()["count"]
+    read_rows = conn.execute(
+        "SELECT payload FROM events WHERE kind='knowledge.read' AND ts >= ?",
+        (cutoff,)).fetchall()
+    read_count = len(read_rows)
+    read_documents: set[str] = set()
+    for row in read_rows:
+        try:
+            document = json.loads(row["payload"] or "{}").get("document")
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if document:
+            read_documents.add(document)
 
     surfaced_counts: dict[str, int] = {}
     for p in searches:
@@ -392,10 +402,12 @@ def stats(conn: sqlite3.Connection, days: int = 30, limit: int = 20) -> dict:
     if surfaced_counts:
         placeholders = ",".join("?" * len(surfaced_counts))
         rows = conn.execute(
-            "SELECT id, path, access_count FROM documents"
-            f" WHERE id IN ({placeholders}) AND deleted_at IS NULL AND access_count = 0",
+            "SELECT id, path FROM documents"
+            f" WHERE id IN ({placeholders}) AND deleted_at IS NULL",
             tuple(surfaced_counts))
         for row in rows:
+            if row["id"] in read_documents:
+                continue
             never_opened.append({"id": row["id"], "path": row["path"],
                                  "surfaced": surfaced_counts[row["id"]]})
         never_opened.sort(key=lambda r: -r["surfaced"])

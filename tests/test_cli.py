@@ -236,7 +236,9 @@ def test_stats_reports_searches_and_failures(home, capsys):
     main(["knowledge", "search", "nothing here", "--all"])
     capsys.readouterr()
     assert main(["knowledge", "stats"]) == 0
-    assert "zero-hit rate" in _out(capsys)
+    output = _out(capsys)
+    assert "zero-hit rate" in output
+    assert "successful reads: 0" in output
 
 
 def test_fsck_in_full_records_the_error_count(home, capsys):

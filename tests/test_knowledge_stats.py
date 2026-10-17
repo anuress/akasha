@@ -12,6 +12,7 @@ from akasha.config import load_config
 from akasha.db import connect
 from akasha.events import emit
 from akasha.knowledge import stats, write
+from akasha.mcp_server import call_tool
 
 
 @pytest.fixture
@@ -73,15 +74,19 @@ def test_surfaced_never_opened_finds_a_live_untouched_document(env):
     assert result["surfaced_never_opened_total"] == 1
 
 
-def test_surfaced_never_opened_excludes_a_document_that_was_since_read(env):
+def test_surfaced_never_opened_uses_reads_not_search_hit_counts(env, monkeypatch):
+    """Search touches every hit, so only read events can identify opened documents."""
     conn, cfg = env
-    doc_id = write(conn, cfg, "Read later", "## Body\nx\n", repo="r")
-    conn.execute("UPDATE documents SET access_count=1 WHERE id=?", (doc_id,))
-    conn.commit()
-    _search(conn, "q", [doc_id], count=1)
+    monkeypatch.setattr("akasha.mcp_server._ctx", lambda: (conn, cfg))
+    opened_id = write(conn, cfg, "Opened", "## Body\nshared-token\n", repo="r")
+    unopened_id = write(conn, cfg, "Unopened", "## Body\nshared-token\n", repo="r")
+
+    hits = call_tool("knowledge_search", {"q": "shared-token", "all_repos": True})
+    assert {hit["document_id"] for hit in hits} == {opened_id, unopened_id}
+    call_tool("knowledge_get", {"id": opened_id})
 
     result = stats(conn, days=30)
-    assert result["surfaced_never_opened"] == []
+    assert [row["id"] for row in result["surfaced_never_opened"]] == [unopened_id]
 
 
 def test_repeated_queries_groups_identical_query_text(env):

@@ -139,10 +139,11 @@ def _knowledge_get(args: dict):
     if hint is not None:
         result["writable"] = False
         result["readonly_hint"] = hint
-    payload = {"document": row["id"], "source": row["source"]}
-    if offset:
-        payload["offset"] = offset
-    emit(conn, "knowledge.read", **payload)
+    if text:
+        payload = {"document": row["id"], "source": row["source"]}
+        if offset:
+            payload["offset"] = offset
+        emit(conn, "knowledge.read", **payload)
     return result
 
 
