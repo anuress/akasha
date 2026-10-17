@@ -5,6 +5,8 @@ import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from akasha.kinds import validate_custom_kinds
+
 # Matched against the file name with fnmatch, so globs work.
 DEFAULT_DENY_FILES = [
     ".env.*",
@@ -61,6 +63,7 @@ class Config:
     knowledge_stale_after_days: int | None = None
     custom_kinds: list[str] = field(default_factory=list)
     config_path: Path | None = None
+    custom_kind_issues: list[str] = field(default_factory=list)
 
 
 def _expand(value: str) -> Path:
@@ -124,6 +127,8 @@ def load_config(path: Path | None = None) -> Config:
 
     paths = raw.get("paths", {})
     security = raw.get("security", {})
+    custom_kinds, custom_kind_issues = validate_custom_kinds(
+        raw.get("knowledge", {}).get("custom_kinds", []))
     roots = expand_roots([
         IndexRoot(
             path=r["path"],
@@ -147,8 +152,9 @@ def load_config(path: Path | None = None) -> Config:
         housekeeping_interval_min=int(raw.get("housekeeping", {}).get("interval_min", 60)),
         knowledge_stale_after_days=_optional_int(
             raw.get("knowledge", {}).get("stale_after_days")),
-        custom_kinds=list(raw.get("knowledge", {}).get("custom_kinds", [])),
+        custom_kinds=custom_kinds,
         config_path=path,
+        custom_kind_issues=custom_kind_issues,
     )
 
 

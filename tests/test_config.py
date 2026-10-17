@@ -59,7 +59,39 @@ def test_custom_kinds_load_from_the_knowledge_section(tmp_path):
     p = tmp_path / "config.toml"
     p.write_text('[knowledge]\ncustom_kinds = ["lesson", "case-note"]\n')
 
-    assert load_config(p).custom_kinds == ["lesson", "case-note"]
+    cfg = load_config(p)
+    assert cfg.custom_kinds == ["lesson", "case-note"]
+    assert cfg.custom_kind_issues == []
+
+
+def test_string_custom_kinds_is_dropped_as_one_invalid_value(tmp_path):
+    """A scalar must not become a list of one-character kinds during loading."""
+    p = tmp_path / "config.toml"
+    p.write_text('[knowledge]\ncustom_kinds = "lesson"\n')
+
+    cfg = load_config(p)
+
+    assert cfg.custom_kinds == []
+    assert len(cfg.custom_kind_issues) == 1
+    assert "lesson" in cfg.custom_kind_issues[0]
+    assert "list" in cfg.custom_kind_issues[0]
+
+
+def test_invalid_duplicate_and_builtin_custom_kinds_are_dropped_individually(tmp_path):
+    """Only unique valid custom names may extend the configured vocabulary."""
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[knowledge]\ncustom_kinds = ["lesson", "Bad Kind", "reference", '
+        '"findings", "lesson"]\n')
+
+    cfg = load_config(p)
+
+    assert cfg.custom_kinds == ["lesson"]
+    assert len(cfg.custom_kind_issues) == 4
+    assert any("Bad Kind" in issue and "lowercase" in issue for issue in cfg.custom_kind_issues)
+    assert any("reference" in issue and "built-in" in issue for issue in cfg.custom_kind_issues)
+    assert any("findings" in issue and "alias" in issue for issue in cfg.custom_kind_issues)
+    assert any("lesson" in issue and "duplicate" in issue for issue in cfg.custom_kind_issues)
 
 
 def test_retention_and_staleness_defaults(tmp_path):

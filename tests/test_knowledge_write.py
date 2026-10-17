@@ -153,6 +153,21 @@ def test_custom_kind_creation_refuses_invalid_names_without_config_changes(env):
         assert cfg.config_path.read_text() == original
 
 
+def test_new_kind_refuses_a_malformed_existing_custom_kind_setting(env):
+    """Registration must apply the same config validation as loading."""
+    from akasha.config_edit import ConfigWriteError
+
+    conn, cfg = env
+    malformed = '[knowledge]\ncustom_kinds = "lesson"\n'
+    cfg.config_path.write_text(malformed)
+
+    with pytest.raises(ConfigWriteError, match="custom_kinds has invalid entries"):
+        write(conn, cfg, "T", "body", repo="sample-repo", kind="lesson", new_kind=True)
+
+    assert cfg.config_path.read_text() == malformed
+    assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+
+
 def test_custom_kind_is_used_by_update_and_unknown_write_names_creation_option(env):
     """Configured kinds share canonical validation in both lifecycle operations."""
     conn, cfg = env

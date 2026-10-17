@@ -164,10 +164,14 @@ def _config(config_path: Path) -> list[Finding]:
 
 
 def _custom_kinds(cfg: Config) -> list[Finding]:
-    if not cfg.custom_kinds:
-        return []
-    return [Finding("custom_kinds", "note",
-                    f"{len(cfg.custom_kinds)} custom kind(s): {', '.join(cfg.custom_kinds)}")]
+    findings = [Finding("custom_kind_config", "error",
+                        f"custom_kinds entry {issue} was dropped")
+                for issue in cfg.custom_kind_issues]
+    if cfg.custom_kinds:
+        findings.append(Finding(
+            "custom_kinds", "note",
+            f"{len(cfg.custom_kinds)} custom kind(s): {', '.join(cfg.custom_kinds)}"))
+    return findings
 
 
 def _knowledge(conn: sqlite3.Connection) -> list[Finding]:

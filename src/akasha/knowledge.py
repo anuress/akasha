@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from akasha.config import Config
+from akasha.kinds import ALIASES, KINDS, canonical_kind, custom_kind_error, validate_custom_kinds
 from akasha.db import new_id, now
 from akasha.markdown import parse_frontmatter, render
 
@@ -29,42 +30,33 @@ class ReadOnlySource(RuntimeError):
 class DriftRefusal(RuntimeError):
     """The file on disk changed since akasha indexed it: another writer got there first."""
 
-KINDS = ("reference", "plan", "spec", "finding", "review", "progress",
-         "decision", "convention", "gotcha", "log")
-ALIASES = {"findings": "finding"}
-_CUSTOM_KIND = re.compile(r"[a-z0-9][a-z0-9-]{0,23}\Z")
-
-def canonical_kind(kind: str, custom_kinds: list[str] | tuple[str, ...] = ()) -> str:
-    """Resolve aliases and reject kinds outside the configured vocabulary."""
-    kind = ALIASES.get(kind, kind)
-    if kind not in KINDS and kind not in custom_kinds:
-        allowed = (*KINDS, *custom_kinds)
-        raise ValueError(
-            f"unknown kind: {kind!r}. Allowed kinds: {', '.join(allowed)}. "
-            "If none fits, call again with new_kind: true to create it."
-        )
-    return kind
-
 def _register_custom_kind(conn: sqlite3.Connection, cfg: Config, kind: str) -> str:
     """Persist one explicitly confirmed kind, preserving all unrelated TOML text."""
-    if not _CUSTOM_KIND.fullmatch(kind) or kind in KINDS or kind in ALIASES:
-        raise ValueError(
-            "new kind must be 1-24 lowercase letters, digits, or hyphens, "
-            "and must not be a built-in kind or alias"
-        )
+    reason = custom_kind_error(kind, cfg.custom_kinds)
+    if reason is not None:
+        raise ValueError(f"new kind {kind!r}: {reason}")
 
-    from akasha.config_edit import get_key, set_key, write_config
+    from akasha.config_edit import ConfigWriteError, get_key, set_key, write_config
 
     path = cfg.config_path or (Path.home() / ".akasha" / "config.toml")
     text = path.read_text() if path.exists() else ""
-    configured = get_key(text, "knowledge", "custom_kinds") or []
+    raw_configured = get_key(text, "knowledge", "custom_kinds")
+    if raw_configured is None:
+        raw_configured = []
+    configured, issues = validate_custom_kinds(raw_configured)
+    if issues:
+        raise ConfigWriteError(
+            "cannot register a kind while [knowledge].custom_kinds has invalid entries: "
+            + "; ".join(issues)
+        )
     if kind not in configured:
-        configured = [*configured, kind]
+        configured.append(kind)
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         write_config(path, set_key(text, "knowledge", "custom_kinds", configured))
         from akasha.events import emit
         emit(conn, "knowledge.kind_created", custom_kind=kind)
     cfg.custom_kinds = list(configured)
+    cfg.custom_kind_issues = []
     return kind
 
 def _slugify(text: str) -> str:

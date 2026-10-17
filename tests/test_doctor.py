@@ -50,6 +50,39 @@ def test_doctor_notes_custom_kinds_to_make_vocabulary_sprawl_visible(env):
     assert doctor.exit_code(findings) == 0
 
 
+def test_doctor_reports_dropped_custom_kinds_with_values_and_reasons(env):
+    """Invalid config entries must not disappear from the agent-facing diagnosis."""
+    conn, cfg, home = env
+    cfg.config_path.write_text(
+        '[knowledge]\ncustom_kinds = ["Bad Kind", "reference", "findings", '
+        '"lesson", "lesson"]\n')
+    cfg = load_config(cfg.config_path)
+
+    findings = doctor.check(cfg, conn, home=home)
+    issues = [f for f in findings if f.kind == "custom_kind_config"]
+
+    assert len(issues) == 4
+    assert all(f.severity == "error" for f in issues)
+    assert any("Bad Kind" in f.detail and "lowercase" in f.detail for f in issues)
+    assert any("reference" in f.detail and "built-in" in f.detail for f in issues)
+    assert any("findings" in f.detail and "alias" in f.detail for f in issues)
+    assert any("lesson" in f.detail and "duplicate" in f.detail for f in issues)
+    assert doctor.exit_code(findings) == 1
+
+
+def test_doctor_reports_a_scalar_custom_kind_value(env):
+    """A scalar config mistake is surfaced rather than split into characters."""
+    conn, cfg, home = env
+    cfg.config_path.write_text('[knowledge]\ncustom_kinds = "lesson"\n')
+    cfg = load_config(cfg.config_path)
+
+    issues = [f for f in doctor.check(cfg, conn, home=home)
+              if f.kind == "custom_kind_config"]
+
+    assert len(issues) == 1
+    assert "lesson" in issues[0].detail and "list" in issues[0].detail
+
+
 def test_a_fresh_install_is_healthy(env):
     findings = _run(env)
     assert doctor.exit_code(findings) == 0
