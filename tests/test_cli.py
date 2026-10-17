@@ -239,6 +239,22 @@ def test_stats_reports_searches_and_failures(home, capsys):
     output = _out(capsys)
     assert "zero-hit rate" in output
     assert "successful reads: 0" in output
+    assert "read tracking has no events yet" in output
+
+
+def test_stats_reports_the_start_of_read_tracking(home, capsys):
+    """The never-opened count needs to identify its read-telemetry start date."""
+    from akasha.config import load_config
+    from akasha.db import connect
+    from akasha.events import emit
+
+    conn = connect(load_config().db_path)
+    event_id = emit(conn, "knowledge.read", document="sample-id", source="native")
+    conn.execute("UPDATE events SET ts=? WHERE id=?", ("2020-01-02T00:00:00+00:00", event_id))
+    conn.commit()
+
+    assert main(["knowledge", "stats"]) == 0
+    assert "never-opened counts searches since 2020-01-02" in _out(capsys)
 
 
 def test_fsck_in_full_records_the_error_count(home, capsys):

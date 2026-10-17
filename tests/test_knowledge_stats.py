@@ -67,11 +67,25 @@ def test_surfaced_id_whose_document_row_is_gone_does_not_crash(env):
 def test_surfaced_never_opened_finds_a_live_untouched_document(env):
     conn, cfg = env
     doc_id = write(conn, cfg, "Untouched", "## Body\nx\n", repo="r")
+    emit(conn, "knowledge.read", document="tracking-marker", source="native")
     _search(conn, "q", [doc_id], count=1)
 
     result = stats(conn, days=30)
     assert [row["id"] for row in result["surfaced_never_opened"]] == [doc_id]
     assert result["surfaced_never_opened_total"] == 1
+
+
+def test_search_before_first_read_event_is_not_counted_as_never_opened(env):
+    """Pre-tracking searches cannot prove that a document was never opened."""
+    conn, cfg = env
+    doc_id = write(conn, cfg, "Before tracking", "## Body\nx\n", repo="r")
+    _search(conn, "q", [doc_id], count=1)
+    emit(conn, "knowledge.read", document="some-other-document", source="native")
+
+    result = stats(conn, days=30)
+
+    assert result["surfaced_never_opened"] == []
+    assert result["reads_since"] is not None
 
 
 def test_surfaced_never_opened_uses_reads_not_search_hit_counts(env, monkeypatch):
@@ -81,6 +95,7 @@ def test_surfaced_never_opened_uses_reads_not_search_hit_counts(env, monkeypatch
     opened_id = write(conn, cfg, "Opened", "## Body\nshared-token\n", repo="r")
     unopened_id = write(conn, cfg, "Unopened", "## Body\nshared-token\n", repo="r")
 
+    call_tool("knowledge_get", {"id": opened_id})
     hits = call_tool("knowledge_search", {"q": "shared-token", "all_repos": True})
     assert {hit["document_id"] for hit in hits} == {opened_id, unopened_id}
     call_tool("knowledge_get", {"id": opened_id})

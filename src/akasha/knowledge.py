@@ -362,22 +362,29 @@ def stats(conn: sqlite3.Connection, days: int = 30, limit: int = 20) -> dict:
     """Retrieval quality, read from `knowledge.searched`, `knowledge.read`, and
     `tool.failed` events.
 
-    Answers what share of searches came back empty, which surfaced documents nobody then
-    opened, and which questions were asked more than once.
+    Answers what share of searches came back empty, which documents surfaced after the
+    earliest retained read event without a read in the window, and which questions repeated.
 
     Events are purged after EVENT_RETENTION_DAYS; a wider window is silently missing the
     tail it claims to cover, so `window_truncated` says so.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    reads_since = conn.execute(
+        "SELECT MIN(ts) AS ts FROM events WHERE kind='knowledge.read'"
+    ).fetchone()["ts"]
 
     searches = []
+    surfaced_searches = []
     for row in conn.execute(
-            "SELECT payload FROM events WHERE kind='knowledge.searched' AND ts >= ?",
+            "SELECT payload, ts FROM events WHERE kind='knowledge.searched' AND ts >= ?",
             (cutoff,)):
         try:
-            searches.append(json.loads(row["payload"] or "{}"))
+            payload = json.loads(row["payload"] or "{}")
         except json.JSONDecodeError:
             continue
+        searches.append(payload)
+        if reads_since is not None and row["ts"] > reads_since:
+            surfaced_searches.append(payload)
 
     zero_hits = sum(1 for p in searches if p.get("count") == 0)
     read_rows = conn.execute(
@@ -394,7 +401,7 @@ def stats(conn: sqlite3.Connection, days: int = 30, limit: int = 20) -> dict:
             read_documents.add(document)
 
     surfaced_counts: dict[str, int] = {}
-    for p in searches:
+    for p in surfaced_searches:
         for doc_id in p.get("ids") or []:
             surfaced_counts[doc_id] = surfaced_counts.get(doc_id, 0) + 1
 
@@ -445,6 +452,7 @@ def stats(conn: sqlite3.Connection, days: int = 30, limit: int = 20) -> dict:
     return {
         "days": days,
         "window_truncated": days > EVENT_RETENTION_DAYS,
+        "reads_since": reads_since,
         "zero_hit": {"count": zero_hits, "total": len(searches)},
         "reads": {"count": read_count},
         "surfaced_never_opened": never_opened[:limit],

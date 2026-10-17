@@ -322,6 +322,10 @@ def cmd_kb_stats(args) -> int:
     else:
         print(f"zero-hit rate: no searches in the last {data['days']}d")
     print(f"successful reads: {data['reads']['count']} (last {data['days']}d)")
+    if data["reads_since"] is None:
+        print("note: read tracking has no events yet; never-opened counts are unavailable")
+    else:
+        print(f"note: never-opened counts searches since {data['reads_since'][:10]}")
     print(f"\nsurfaced but never opened: {data['surfaced_never_opened_total']}")
     for row in data["surfaced_never_opened"]:
         print(f"  surfaced={row['surfaced']:<3d} {row['path']}")
