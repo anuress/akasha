@@ -201,6 +201,20 @@ def test_search_scrubs_an_instruction_span_and_records_the_document(env):
     assert any(f["document"] == out["id"] and f["path"] for f in flagged)
 
 
+def test_successful_get_records_a_small_read_event(env):
+    """Read telemetry distinguishes opened documents from search-only appearances."""
+    conn, _ = env
+    doc = call_tool("knowledge_write", {"title": "T", "body": "## H\nnotes", "repo": "r"})
+
+    call_tool("knowledge_get", {"id": doc["id"]})
+    call_tool("knowledge_get", {"id": doc["id"], "offset": 2})
+
+    assert _events(conn, "knowledge.read") == [
+        {"document": doc["id"], "source": "native", "offset": 2},
+        {"document": doc["id"], "source": "native"},
+    ]
+
+
 def test_get_redacts_what_search_redacts_and_leaves_the_file_alone(env):
     conn, _ = env
     out = call_tool("knowledge_write", {"title": "T", "body": SECRET_DOC, "repo": "r"})
@@ -370,6 +384,7 @@ def test_an_error_result_is_recorded_and_returned_unchanged(env):
     assert result == {"error": "unknown document: bogus-id"}
     [event] = _events(conn, "tool.failed")
     assert (event["tool"], event["phase"]) == ("knowledge_get", "result")
+    assert _events(conn, "knowledge.read") == []
 
 
 def test_a_read_only_document_refuses_writes_with_a_clear_message(env, tmp_path):

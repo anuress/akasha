@@ -321,6 +321,7 @@ def cmd_kb_stats(args) -> int:
               f"({zero['count']}/{zero['total']} searches, last {data['days']}d)")
     else:
         print(f"zero-hit rate: no searches in the last {data['days']}d")
+    print(f"successful reads: {data['reads']['count']} (last {data['days']}d)")
     print(f"\nsurfaced but never opened: {data['surfaced_never_opened_total']}")
     for row in data["surfaced_never_opened"]:
         print(f"  surfaced={row['surfaced']:<3d} {row['path']}")

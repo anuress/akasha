@@ -379,6 +379,9 @@ def stats(conn: sqlite3.Connection, days: int = 30, limit: int = 20) -> dict:
             continue
 
     zero_hits = sum(1 for p in searches if p.get("count") == 0)
+    read_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM events WHERE kind='knowledge.read' AND ts >= ?",
+        (cutoff,)).fetchone()["count"]
 
     surfaced_counts: dict[str, int] = {}
     for p in searches:
@@ -431,6 +434,7 @@ def stats(conn: sqlite3.Connection, days: int = 30, limit: int = 20) -> dict:
         "days": days,
         "window_truncated": days > EVENT_RETENTION_DAYS,
         "zero_hit": {"count": zero_hits, "total": len(searches)},
+        "reads": {"count": read_count},
         "surfaced_never_opened": never_opened[:limit],
         "surfaced_never_opened_total": len(never_opened),
         "repeated_queries": repeated[:limit],

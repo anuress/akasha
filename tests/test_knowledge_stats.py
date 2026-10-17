@@ -96,6 +96,17 @@ def test_repeated_queries_groups_identical_query_text(env):
     assert result["repeated_queries"] == [{"query": "how does X work", "count": 2}]
 
 
+def test_stats_counts_read_events_only_inside_the_requested_window(env):
+    """Read totals must use retained read events, not search-hit access counts."""
+    conn, _ = env
+    emit(conn, "knowledge.read", document="doc-1", source="native")
+    event_id = emit(conn, "knowledge.read", document="doc-2", source="native")
+    conn.execute("UPDATE events SET ts=? WHERE id=?", (_old_ts(), event_id))
+    conn.commit()
+
+    assert stats(conn, days=30)["reads"] == {"count": 1}
+
+
 def test_window_boundary_excludes_events_older_than_the_requested_days(env):
     conn, cfg = env
     _search(conn, "ancient", [], count=0, ts=_old_ts())
