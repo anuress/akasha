@@ -244,6 +244,8 @@ def search(
     from its own text would otherwise self-match and never reach a real neighbour.
     """
     # Normalize caller vocabulary once so every entry point shares the same semantics.
+    # Validate once so every entry point fails alike; otherwise a bad value could silently
+    # match nothing or fall through to another strategy.
     match_mode = {"or": "any", "strict": "all"}.get(match_mode, match_mode)
     if match_mode not in ("auto", "all", "any"):
         raise ValueError(
