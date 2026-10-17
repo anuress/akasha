@@ -26,3 +26,23 @@ jobs:
           fi
       - run: uv build
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Commits land on main without PRs, so --generate-notes would be empty; the commit
+      # subjects since the previous tag are the changelog.
+      - name: GitHub release with the commits since the previous tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prev=$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || true)
+          range=${prev:+$prev..}$GITHUB_REF_NAME
+          git log --no-merges --format='- %s (%h)' "$range" | grep -v '^- Release ' > notes.md || true
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md
