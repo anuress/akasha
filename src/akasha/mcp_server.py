@@ -19,6 +19,7 @@ from akasha import knowledge as kb
 from akasha import links as lk
 from akasha import vectors
 from akasha.config import Config, load_config
+from akasha.config_edit import ConfigWriteError
 from akasha.db import SchemaMismatch, connect
 from akasha.events import emit
 from akasha.features import show as feature_show_core
@@ -200,7 +201,8 @@ def _knowledge_write(args: dict):
     fold = _fold_candidates(conn, cfg, args["title"], args["body"])
     doc_id = kb.write(conn, cfg, args["title"], args["body"], repo=repo,
                       feature=args.get("feature"), kind=kind,
-                      supersedes=args.get("supersedes"))
+                      supersedes=args.get("supersedes"),
+                      new_kind=args.get("new_kind", False))
     _written(conn, "knowledge_write", doc_id, repo=repo)
     # repo is echoed because it is derived, not always what the caller typed.
     return {"id": doc_id, "repo": repo, **fold}
@@ -312,7 +314,8 @@ DESCRIPTIONS = {
         "document rather than writing a near-duplicate. Record the decision rule, the "
         "numbers, what was ruled out and why, not a summary of what you read. If an earlier "
         "conclusion proved wrong, pass its id in supersedes. kind: reference, plan, spec, "
-        "finding, review, progress, decision, gotcha, log. The response lists "
+        "finding, review, progress, decision, gotcha, log. Set new_kind=true to register a "
+        "new kind. The response lists "
         "fold_candidates, documents this may belong in; read them before treating the write "
         "as done. repo defaults to the current checkout and the response says which."),
     "knowledge_update": (
@@ -337,7 +340,7 @@ DESCRIPTIONS = {
 
 # A handler failure the caller can act on is returned as a message; anything else is a
 # bug and propagates (the framework reports it) after being recorded.
-EXPECTED_ERRORS = (ValueError, KeyError, PermissionError, kb.StaleWrite,
+EXPECTED_ERRORS = (ValueError, KeyError, PermissionError, ConfigWriteError, kb.StaleWrite,
                    kb.ReadOnlySource, kb.DriftRefusal)
 
 # Set by the validate middleware before the call and mutated in place by
@@ -523,10 +526,10 @@ def build_server():
     @server.tool(description=DESCRIPTIONS["knowledge_write"])
     def knowledge_write(title: str, body: str, repo: str | None = None,
                         feature: str | None = None, kind: str = "reference",
-                        supersedes: list[str] | None = None) -> str:
+                        supersedes: list[str] | None = None, new_kind: bool = False) -> str:
         return _json(call_tool("knowledge_write", {
             "title": title, "body": body, "repo": repo, "feature": feature, "kind": kind,
-            "supersedes": supersedes}))
+            "supersedes": supersedes, "new_kind": new_kind}))
 
     @server.tool(description=DESCRIPTIONS["knowledge_update"])
     def knowledge_update(id: str, body: str | None = None, match: str | None = None,

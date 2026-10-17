@@ -108,7 +108,7 @@ def test_two_appends_both_survive(env):
 
 
 def test_canonical_kind_resolves_aliases_and_names_the_vocabulary_on_refusal():
-    """The refusal lists what is allowed: the next guess is no better informed."""
+    """The refusal lists allowed kinds and how to register one instead of inviting a blind retry."""
     from akasha.knowledge import KINDS, canonical_kind
 
     assert canonical_kind("findings") == "finding"
@@ -116,6 +116,51 @@ def test_canonical_kind_resolves_aliases_and_names_the_vocabulary_on_refusal():
     with pytest.raises(ValueError) as exc:
         canonical_kind("essay")
     assert all(kind in str(exc.value) for kind in KINDS)
+    assert "new_kind: true" in str(exc.value)
+
+
+def test_confirmed_custom_kind_is_registered_persisted_and_written(env):
+    """A confirmed kind remains available after reload and is indexed as itself."""
+    import tomllib
+    from pathlib import Path
+    from akasha.config import load_config
+    from akasha.events import recent
+
+    conn, cfg = env
+    cfg.config_path.write_text('# keep this comment\n[paths]\nknowledge = "~/notes"\n')
+    doc_id = write(conn, cfg, "A lesson", "## Body\nunique custom text\n", repo="sample-repo",
+                   kind="lesson", new_kind=True)
+
+    assert conn.execute("SELECT kind FROM documents WHERE id=?", (doc_id,)).fetchone()[0] == "lesson"
+    from akasha.search import search
+    assert [h.document_id for h in search(conn, "custom text", kind="lesson", all_repos=True)] == [doc_id]
+    assert load_config(cfg.config_path).custom_kinds == ["lesson"]
+    assert "# keep this comment" in cfg.config_path.read_text()
+    assert tomllib.loads(cfg.config_path.read_text())["paths"]["knowledge"] == "~/notes"
+    assert any(e["kind"] == "knowledge.kind_created" for e in recent(conn))
+    assert Path(conn.execute("SELECT path FROM documents WHERE id=?", (doc_id,)).fetchone()[0]).exists()
+
+
+def test_custom_kind_creation_refuses_invalid_names_without_config_changes(env):
+    """Only short lowercase identifier-like kinds may alter config."""
+    conn, cfg = env
+    original = '[knowledge]\ncustom_kinds = []\n'
+    cfg.config_path.write_text(original)
+
+    for kind in ("Upper", "two words", "too-long-kind-name-that-exceeds"):
+        with pytest.raises(ValueError):
+            write(conn, cfg, "T", "body", repo="sample-repo", kind=kind, new_kind=True)
+        assert cfg.config_path.read_text() == original
+
+
+def test_custom_kind_is_used_by_update_and_unknown_write_names_creation_option(env):
+    """Configured kinds share canonical validation in both lifecycle operations."""
+    conn, cfg = env
+    doc_id = write(conn, cfg, "T", "## Body\ntext\n", repo="sample-repo",
+                   kind="lesson", new_kind=True)
+    assert update(conn, cfg, doc_id, kind="lesson") == doc_id
+    with pytest.raises(ValueError, match="new_kind: true"):
+        write(conn, cfg, "Other", "body", repo="sample-repo", kind="essay")
 
 
 def test_the_indexer_falls_back_for_a_kind_write_would_refuse(env):

@@ -105,7 +105,7 @@ def test_tools_expose_exactly_the_documented_parameters():
         "knowledge_search": {"all_repos", "as_of", "feature", "include_archived", "kind",
                              "limit", "match_mode", "max_chars", "query", "repo", "source"},
         "knowledge_get": {"id", "max_chars", "offset"},
-        "knowledge_write": {"body", "feature", "kind", "repo", "supersedes", "title"},
+        "knowledge_write": {"body", "feature", "kind", "new_kind", "repo", "supersedes", "title"},
         "knowledge_update": {"body", "expected_updated", "id", "kind", "match",
                              "replacement", "status", "title"},
         "knowledge_append": {"body", "heading", "id"},
@@ -117,6 +117,37 @@ def test_tools_expose_exactly_the_documented_parameters():
         "doctor": {"limit"},
     }
     assert {t.name: set(t.input_schema["properties"]) for t in _listed()} == documented
+
+
+def test_write_can_confirm_a_custom_kind_but_cannot_use_convention(env):
+    """The new-kind flag registers custom vocabulary without bypassing convention policy."""
+    conn, cfg = env
+    result = call_tool("knowledge_write", {
+        "title": "A lesson", "body": "## A\\nlesson-token", "repo": "sample-repo",
+        "kind": "lesson", "new_kind": True,
+    })
+
+    assert "id" in result
+    assert cfg.custom_kinds == ["lesson"]
+    refused = call_tool("knowledge_write", {
+        "title": "A rule", "body": "rule", "repo": "sample-repo",
+        "kind": "convention", "new_kind": True,
+    })
+    assert "CLI-only" in refused["error"]
+
+
+def test_custom_kind_creation_reports_an_unparseable_config_without_writing(env):
+    """A failed config edit is a caller-actionable refusal, not an uncaught handler error."""
+    conn, cfg = env
+    cfg.config_path.write_text("[knowledge\n")
+
+    result = call_tool("knowledge_write", {
+        "title": "A lesson", "body": "lesson-token", "repo": "sample-repo",
+        "kind": "lesson", "new_kind": True,
+    })
+
+    assert "error" in result and "would not parse" in result["error"]
+    assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
 
 
 def test_search_exposes_query_not_q():

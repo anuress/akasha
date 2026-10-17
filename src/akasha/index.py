@@ -159,7 +159,8 @@ def index_path(
     # Same vocabulary as write(), but indexing is bulk: one bad file must not stop a run,
     # so an unknown kind becomes reference and is counted.
     try:
-        kind, kind_fallback = canonical_kind(meta.get("kind") or _guess_kind(path)), 0
+        kind, kind_fallback = canonical_kind(
+            meta.get("kind") or _guess_kind(path), cfg.custom_kinds), 0
     except ValueError:
         kind, kind_fallback = "reference", 1
     status = meta.get("status") or "active"
@@ -231,6 +232,7 @@ def _scan_config_marker(cfg: Config) -> str:
         "scan_secrets": cfg.scan_secrets,
         "deny_files": sorted(cfg.deny_files),
         "deny_extensions": sorted(cfg.deny_extensions),
+        "custom_kinds": sorted(cfg.custom_kinds),
         "secrets": [(n, p.pattern) for n, p in SECRET_PATTERNS],
         "injection": [(n, p.pattern) for n, p in INJECTION_PATTERNS],
         "strip": sorted(INJECTION_STRIP_RULES),

@@ -172,7 +172,19 @@ def test_write_can_supersede_from_the_cli(home, capsys):
 
 def test_an_unknown_kind_is_refused_with_the_allowed_list(home, capsys):
     assert main(["knowledge", "write", "--title", "T", "--body", "b", "--kind", "notes"]) == 1
-    assert "finding" in _out(capsys)
+    output = _out(capsys)
+    assert "finding" in output
+    assert "new_kind: true" in output
+
+
+def test_cli_can_confirm_and_reuse_a_custom_kind(home, capsys):
+    from akasha.config import load_config
+
+    assert main(["knowledge", "write", "--title", "A lesson", "--body", "lesson-token",
+                 "--kind", "lesson", "--new-kind"]) == 0
+    assert load_config(home / ".akasha" / "config.toml").custom_kinds == ["lesson"]
+    assert main(["knowledge", "write", "--title", "Another lesson", "--body", "more",
+                 "--kind", "lesson"]) == 0
 
 
 def test_update_append_and_archive(home, capsys):

@@ -29,6 +29,22 @@ def test_index_derives_repo_and_feature_from_path(env):
     assert fid["slug"] == "proj-100"
 
 
+def test_registered_custom_kind_reindexes_unchanged_files_without_reference_fallback(env):
+    """Adding a kind changes scan semantics, so existing unknown-kind files are reprocessed."""
+    conn, cfg, root = env
+    doc = root / "sample-repo" / "proj-100" / "design.md"
+    doc.write_text('---\nkind: lesson\n---\n## A\ncustom-kind-token\n')
+
+    first = index_all(conn, cfg)
+    assert first.kind_fallback == 1
+    cfg.custom_kinds = ["lesson"]
+    second = index_all(conn, cfg)
+
+    assert second.indexed == 1
+    assert second.kind_fallback == 0
+    assert conn.execute("SELECT kind FROM documents").fetchone()[0] == "lesson"
+
+
 def test_index_creates_chunks_per_heading(env):
     conn, cfg, root = env
     doc = root / "sample-repo" / "proj-100" / "design.md"

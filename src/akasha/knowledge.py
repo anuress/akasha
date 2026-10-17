@@ -32,17 +32,39 @@ class DriftRefusal(RuntimeError):
 KINDS = ("reference", "plan", "spec", "finding", "review", "progress",
          "decision", "convention", "gotcha", "log")
 ALIASES = {"findings": "finding"}
+_CUSTOM_KIND = re.compile(r"[a-z0-9][a-z0-9-]{0,23}\Z")
 
-def canonical_kind(kind: str) -> str:
-    """Resolve an alias and reject anything outside the vocabulary.
-
-    The error names what is allowed, because the next guess is no better informed than
-    the last. The index path is bulk and unattended, so it uses this too but decides its
-    own handling for an unknown kind.
-    """
+def canonical_kind(kind: str, custom_kinds: list[str] | tuple[str, ...] = ()) -> str:
+    """Resolve aliases and reject kinds outside the configured vocabulary."""
     kind = ALIASES.get(kind, kind)
-    if kind not in KINDS:
-        raise ValueError(f"unknown kind: {kind!r}. Allowed kinds: {', '.join(KINDS)}")
+    if kind not in KINDS and kind not in custom_kinds:
+        allowed = (*KINDS, *custom_kinds)
+        raise ValueError(
+            f"unknown kind: {kind!r}. Allowed kinds: {', '.join(allowed)}. "
+            "If none fits, call again with new_kind: true to create it."
+        )
+    return kind
+
+def _register_custom_kind(conn: sqlite3.Connection, cfg: Config, kind: str) -> str:
+    """Persist one explicitly confirmed kind, preserving all unrelated TOML text."""
+    if not _CUSTOM_KIND.fullmatch(kind) or kind in KINDS or kind in ALIASES:
+        raise ValueError(
+            "new kind must be 1-24 lowercase letters, digits, or hyphens, "
+            "and must not be a built-in kind or alias"
+        )
+
+    from akasha.config_edit import get_key, set_key, write_config
+
+    path = cfg.config_path or (Path.home() / ".akasha" / "config.toml")
+    text = path.read_text() if path.exists() else ""
+    configured = get_key(text, "knowledge", "custom_kinds") or []
+    if kind not in configured:
+        configured = [*configured, kind]
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        write_config(path, set_key(text, "knowledge", "custom_kinds", configured))
+        from akasha.events import emit
+        emit(conn, "knowledge.kind_created", custom_kind=kind)
+    cfg.custom_kinds = list(configured)
     return kind
 
 def _slugify(text: str) -> str:
@@ -175,8 +197,8 @@ def write(
     feature: str | None = None,
     kind: str = "reference",
     supersedes: list[str] | None = None,
+    new_kind: bool = False,
 ) -> str:
-    kind = canonical_kind(kind)
     folder = cfg.knowledge_dir / (repo or "_global")
     # The repo names a directory, so anything but a plain name could write outside the
     # knowledge dir; the resolve check also catches a symlinked folder.
@@ -190,6 +212,14 @@ def write(
         if old["deleted_at"] is not None:
             raise ValueError(f"cannot supersede {old_id}: it is deleted")
         _require_native(old)
+
+    try:
+        kind = canonical_kind(kind, cfg.custom_kinds)
+    except ValueError:
+        if not new_kind:
+            raise
+        kind = _register_custom_kind(conn, cfg, kind)
+
     doc_id = new_id("k")
     folder.mkdir(parents=True, exist_ok=True)
 
@@ -265,7 +295,7 @@ def update(
     _check_no_drift(row, path)
     meta, current_body = parse_frontmatter(path.read_text())
     if fields.get("kind") is not None:
-        fields["kind"] = canonical_kind(fields["kind"])
+        fields["kind"] = canonical_kind(fields["kind"], cfg.custom_kinds)
     for key, value in fields.items():
         if value is not None:
             meta[key] = value

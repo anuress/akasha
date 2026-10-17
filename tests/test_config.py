@@ -51,6 +51,15 @@ def test_default_config_toml_is_parseable_and_matches_the_defaults(tmp_path):
     assert written.scan_secrets == absent.scan_secrets
     assert written.housekeeping_interval_min == absent.housekeeping_interval_min
     assert written.knowledge_stale_after_days is None
+    assert written.custom_kinds == []
+
+
+def test_custom_kinds_load_from_the_knowledge_section(tmp_path):
+    """Configured kinds must survive reload so indexing and writes share a vocabulary."""
+    p = tmp_path / "config.toml"
+    p.write_text('[knowledge]\ncustom_kinds = ["lesson", "case-note"]\n')
+
+    assert load_config(p).custom_kinds == ["lesson", "case-note"]
 
 
 def test_retention_and_staleness_defaults(tmp_path):

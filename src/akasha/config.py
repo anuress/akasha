@@ -59,6 +59,8 @@ class Config:
     # Days of disuse before a document is reported stale. Unset means never: disuse alone
     # is not evidence a document is wrong.
     knowledge_stale_after_days: int | None = None
+    custom_kinds: list[str] = field(default_factory=list)
+    config_path: Path | None = None
 
 
 def _expand(value: str) -> Path:
@@ -91,6 +93,8 @@ interval_min = 60
 [knowledge]
 # Days of disuse before `akasha knowledge stale` reports a document. Unset means never.
 # stale_after_days = 90
+# Custom document kinds created with `knowledge_write(new_kind=true)`.
+# custom_kinds = []
 '''
 
 
@@ -143,6 +147,8 @@ def load_config(path: Path | None = None) -> Config:
         housekeeping_interval_min=int(raw.get("housekeeping", {}).get("interval_min", 60)),
         knowledge_stale_after_days=_optional_int(
             raw.get("knowledge", {}).get("stale_after_days")),
+        custom_kinds=list(raw.get("knowledge", {}).get("custom_kinds", [])),
+        config_path=path,
     )
 
 

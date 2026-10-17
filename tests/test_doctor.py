@@ -37,6 +37,19 @@ def no_vendors(monkeypatch):
     monkeypatch.setattr("akasha.doctor.detect_vendors", lambda: [])
 
 
+def test_doctor_notes_custom_kinds_to_make_vocabulary_sprawl_visible(env):
+    """Custom vocabulary is visible without making a healthy installation degraded."""
+    conn, cfg, home = env
+    cfg.custom_kinds = ["lesson", "case-note"]
+
+    findings = doctor.check(cfg, conn, home=home)
+
+    row = next(f for f in findings if f.kind == "custom_kinds")
+    assert row.severity == "note"
+    assert "lesson" in row.detail and "case-note" in row.detail
+    assert doctor.exit_code(findings) == 0
+
+
 def test_a_fresh_install_is_healthy(env):
     findings = _run(env)
     assert doctor.exit_code(findings) == 0

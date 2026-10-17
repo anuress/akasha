@@ -236,7 +236,7 @@ def cmd_kb_write(args) -> int:
         return 1
     repo, _source = resolve_repo(cfg, Path.cwd(), args.repo)
     doc_id = kb.write(conn, cfg, args.title, body, repo=repo, feature=args.feature,
-                      kind=args.kind, supersedes=args.supersedes)
+                      kind=args.kind, supersedes=args.supersedes, new_kind=args.new_kind)
     print(doc_id)
     if (args.kind or "").lower() == "convention":
         _warn_convention_over_budget(conn, doc_id)
@@ -609,6 +609,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="document kind: reference, finding, plan, ... (default reference)")
     p.add_argument("--supersedes", nargs="+", metavar="ID",
                    help="documents this one replaces; each is archived")
+    p.add_argument("--new-kind", action="store_true",
+                   help="register an unknown kind before writing")
     p.set_defaults(func=cmd_kb_write)
 
     p = kb_sub.add_parser("update", help="correct a document in place")

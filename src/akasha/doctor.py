@@ -163,6 +163,13 @@ def _config(config_path: Path) -> list[Finding]:
     return []
 
 
+def _custom_kinds(cfg: Config) -> list[Finding]:
+    if not cfg.custom_kinds:
+        return []
+    return [Finding("custom_kinds", "note",
+                    f"{len(cfg.custom_kinds)} custom kind(s): {', '.join(cfg.custom_kinds)}")]
+
+
 def _knowledge(conn: sqlite3.Connection) -> list[Finding]:
     docs = conn.execute(
         "SELECT COUNT(*) c FROM documents WHERE deleted_at IS NULL").fetchone()["c"]
@@ -225,6 +232,7 @@ def check(cfg: Config, conn: sqlite3.Connection, home: Path | None = None,
         ("config", lambda: _config(config_path)),
         ("index_root", lambda: _sources(cfg, conn)),
         ("knowledge", lambda: _knowledge(conn)),
+        ("custom_kinds", lambda: _custom_kinds(cfg)),
         ("conventions", lambda: _conventions(conn)),
         ("vectors", lambda: [_vectors(cfg, conn)]),
         ("mcp", lambda: _integrations(home)),
