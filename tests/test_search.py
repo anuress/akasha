@@ -471,8 +471,9 @@ def test_an_unknown_match_mode_is_refused(tmp_path):
     """A typo in match_mode must not silently fall through to a different strategy."""
     from akasha.db import connect
 
-    with pytest.raises(ValueError, match="match_mode"):
+    with pytest.raises(ValueError, match="match_mode") as error:
         search(connect(tmp_path / "s.db"), "x", match_mode="fuzzy")
+    assert "auto, all, any, or, strict" in str(error.value)
 
 
 @pytest.mark.parametrize("text", ["20240101", "2024-1-1", "garbage", "2024-01-01T00:00"])

@@ -243,10 +243,12 @@ def search(
     for `link_candidates` re-scanning a document that is already indexed: a query built
     from its own text would otherwise self-match and never reach a real neighbour.
     """
-    # Validated once here so every entry point fails the same way; a bad value silently
-    # matching nothing or falling through to another strategy would be silent degradation.
+    # Normalize caller vocabulary once so every entry point shares the same semantics.
+    match_mode = {"or": "any", "strict": "all"}.get(match_mode, match_mode)
     if match_mode not in ("auto", "all", "any"):
-        raise ValueError(f"match_mode must be auto, all or any, got {match_mode!r}")
+        raise ValueError(
+            f"match_mode must be one of: auto, all, any, or, strict; got {match_mode!r}"
+        )
     if as_of is not None:
         iso_date(as_of)
     if not q.strip():

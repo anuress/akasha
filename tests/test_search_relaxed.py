@@ -46,6 +46,17 @@ def test_explicit_any_mode_is_relaxed_from_the_start(env):
     assert hits and all(h.relaxed for h in hits)
 
 
+def test_or_alias_matches_any_for_agents_using_the_short_form(env):
+    conn, _ = env
+    hits = search(conn, "caching sweep", all_repos=True, match_mode="or")
+    assert hits and all(h.relaxed for h in hits)
+
+
+def test_strict_alias_matches_all_without_falling_back_for_agents(env):
+    conn, _ = env
+    assert search(conn, "caching sweep", all_repos=True, match_mode="strict") == []
+
+
 def test_a_repo_scope_widens_but_source_and_kind_stay_hard(env):
     """The repo scope is a preference: knowledge is deliberately cross-repo, and an agent
     asking from the wrong checkout should get the answer, marked, rather than silence.

@@ -579,7 +579,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--as-of", type=_iso_date, metavar="DATE",
                    help="answer from documents valid on this ISO date (YYYY-MM-DD)")
     p.add_argument("--all", action="store_true", help="search every repo, not just this one")
-    p.add_argument("--match", dest="match_mode", choices=["auto", "all", "any"], default="auto",
+    p.add_argument("--match", dest="match_mode", choices=["auto", "all", "any", "or", "strict"], default="auto",
                    help="auto retries as OR when strict AND finds nothing")
     p.add_argument("--max-chars", type=int, dest="max_chars",
                    help="cut each hit's text to this many characters (default 400 in the "

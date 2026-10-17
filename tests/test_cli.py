@@ -86,6 +86,11 @@ def test_write_then_search_roundtrip(home, capsys):
     assert "limit 30 wins" in _out(capsys)
 
 
+@pytest.mark.parametrize("mode", ["or", "strict"])
+def test_cli_accepts_match_aliases_to_match_agent_vocabulary(home, mode):
+    assert main(["knowledge", "search", "no results", "--all", "--match", mode]) == 0
+
+
 def test_search_json_uses_the_caller_shape(home, capsys):
     _write(capsys, "--title", "T", "--body", "## A\njsonable", "--repo", "r")
     main(["knowledge", "search", "jsonable", "--all", "--json"])
