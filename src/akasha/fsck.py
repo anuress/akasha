@@ -231,13 +231,20 @@ def check(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:
     for row in conn.execute(
         "SELECT id, path FROM documents"
         " WHERE deleted_at IS NULL AND source = 'native' AND status != 'archived'"
-        " AND size > ?", (MAX_READ_CHARS,)
     ):
         file = Path(row["path"])
         try:
+            file_stat = file.stat()
+        except FileNotFoundError:
+            # missing_file owns absent paths; a mid-run disappearance is reported next run.
+            continue
+        if file_stat.st_size <= MAX_READ_CHARS:
+            continue
+        try:
             chars = len(file.read_text(errors="replace"))
         except FileNotFoundError:
-            continue             # missing_file reports it, including a concurrent removal
+            # missing_file owns absent paths; a mid-run disappearance is reported next run.
+            continue
         if chars > MAX_READ_CHARS:
             findings.append(Finding(
                 "oversized", "warning", row["id"],

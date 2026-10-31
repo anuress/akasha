@@ -8,10 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 from akasha import mcp_server
-from akasha.config import load_config
+from akasha.config import IndexRoot, load_config
 from akasha.db import connect
 from akasha.events import recent
 from akasha.fsck import MAX_READ_CHARS
+from akasha.index import index_path
 from akasha.mcp_server import TOOLS, call_tool
 
 KEPT_TOOLS = {
@@ -223,19 +224,53 @@ def test_append_that_crosses_the_get_window_returns_a_size_warning(env):
     """The writer should hear when its append makes one-call retrieval impossible."""
     conn, _ = env
     doc = call_tool("knowledge_write", {"title": "Large", "body": "small", "repo": "r"})
+    path = Path(conn.execute("SELECT path FROM documents WHERE id=?",
+                             (doc["id"],)).fetchone()["path"])
+    heading = "## Boundary"
+    current_chars = len(path.read_text(errors="replace"))
+    added_text = "x" * (MAX_READ_CHARS + 1 - current_chars - len(f"\n\n{heading}\n\n") - 1)
 
     result = call_tool("knowledge_append", {
-        "id": doc["id"], "text": "x" * MAX_READ_CHARS})
+        "id": doc["id"], "text": added_text, "heading": heading})
 
-    path = conn.execute("SELECT path FROM documents WHERE id=?",
-                        (doc["id"],)).fetchone()["path"]
-    chars = len(Path(path).read_text(errors="replace"))
+    chars = len(path.read_text(errors="replace"))
+    assert chars == MAX_READ_CHARS + 1
     assert result == {
         "id": doc["id"],
         "size_warning": f"{chars} chars, over the {MAX_READ_CHARS}-char knowledge_get window; "
                         f"write a summary with supersedes=[{doc['id']}] instead of "
                         "appending further",
     }
+
+
+def test_append_at_the_get_window_keeps_the_existing_response(env):
+    """An append that lands exactly on the one-call limit needs no warning."""
+    conn, _ = env
+    doc = call_tool("knowledge_write", {"title": "Boundary", "body": "small", "repo": "r"})
+    path = Path(conn.execute("SELECT path FROM documents WHERE id=?",
+                             (doc["id"],)).fetchone()["path"])
+    heading = "## Boundary"
+    current_chars = len(path.read_text(errors="replace"))
+    added_text = "x" * (MAX_READ_CHARS - current_chars - len(f"\n\n{heading}\n\n") - 1)
+
+    result = call_tool("knowledge_append", {
+        "id": doc["id"], "text": added_text, "heading": heading})
+
+    assert len(path.read_text(errors="replace")) == MAX_READ_CHARS
+    assert result == {"id": doc["id"]}
+
+
+def test_append_to_a_writable_non_native_oversized_document_keeps_id_response(env, tmp_path):
+    """Only native documents can be superseded, so external append warnings are omitted."""
+    conn, cfg = env
+    root = tmp_path / "indexed"
+    doc = root / "sample-repo" / "notes" / "large.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text("x" * (MAX_READ_CHARS + 1))
+    cfg.index_roots = [IndexRoot(path=str(root), source="sample-notes", writable=True)]
+    doc_id = index_path(conn, cfg, doc, "sample-notes", root=root)[0]
+
+    assert call_tool("knowledge_append", {"id": doc_id, "text": "append"}) == {"id": doc_id}
 
 
 def test_append_to_a_small_document_keeps_the_existing_response(env):
@@ -264,6 +299,41 @@ def test_append_still_returns_id_if_the_file_disappears_after_write(env, monkeyp
 
     assert result == {"id": doc["id"]}
     assert _events(conn, "knowledge.written")[0]["tool"] == "knowledge_append"
+
+
+@pytest.mark.parametrize("operation", ["stat", "read_text"])
+def test_append_reports_when_permission_denies_the_post_write_size_check(
+    env, monkeypatch, operation
+):
+    """A denied size check must not make a successful append look retryable."""
+    conn, _ = env
+    body = "x" * (MAX_READ_CHARS + 1) if operation == "read_text" else "small"
+    doc = call_tool("knowledge_write", {"title": "Size check", "body": body, "repo": "r"})
+    path = Path(conn.execute("SELECT path FROM documents WHERE id=?",
+                             (doc["id"],)).fetchone()["path"])
+    append = mcp_server.kb.append
+    original = getattr(Path, operation)
+
+    def deny_path(file, *args, **kwargs):
+        if file == path:
+            raise PermissionError("cannot inspect document")
+        return original(file, *args, **kwargs)
+
+    def append_then_deny(*args, **kwargs):
+        append(*args, **kwargs)
+        monkeypatch.setattr(Path, operation, deny_path)
+
+    monkeypatch.setattr(mcp_server.kb, "append", append_then_deny)
+
+    result = call_tool("knowledge_append", {"id": doc["id"], "text": "still small"})
+
+    assert result == {
+        "id": doc["id"],
+        "size_check_unavailable": "append succeeded, but PermissionError prevented "
+                                   "the size check",
+    }
+    assert _events(conn, "knowledge.written")[0]["tool"] == "knowledge_append"
+    assert not any(e["tool"] == "knowledge_append" for e in _events(conn, "tool.failed"))
 
 
 def test_search_scrubs_an_instruction_span_and_records_the_document(env):

@@ -2,9 +2,10 @@ from pathlib import Path
 
 import pytest
 
-from akasha.config import load_config
+from akasha.config import IndexRoot, load_config
 from akasha.db import connect
 from akasha.fsck import MAX_READ_CHARS, check
+from akasha.index import index_path
 from akasha.knowledge import write
 
 
@@ -70,6 +71,47 @@ def test_size_prefilter_confirms_the_document_character_count(env):
     conn.execute("UPDATE documents SET size=? WHERE id=?", (MAX_READ_CHARS + 1, doc_id))
     conn.commit()
 
+    assert not any(f.kind == "oversized" and f.document_id == doc_id for f in check(conn, cfg))
+
+
+def test_a_document_exactly_at_the_get_window_is_not_flagged(env):
+    """Only files with more characters than the retrieval window should be reported."""
+    conn, cfg = env
+    doc_id = write(conn, cfg, "Boundary", "small body", repo="r")
+    path = Path(conn.execute("SELECT path FROM documents WHERE id=?",
+                             (doc_id,)).fetchone()["path"])
+    text = path.read_text(errors="replace")
+    path.write_text(text + "x" * (MAX_READ_CHARS - len(text)))
+
+    assert len(path.read_text(errors="replace")) == MAX_READ_CHARS
+    assert not any(f.kind == "oversized" and f.document_id == doc_id for f in check(conn, cfg))
+
+
+def test_a_native_file_grown_without_reindexing_is_flagged(env):
+    """The indexed byte size must not hide a file edited past the get window."""
+    conn, cfg = env
+    doc_id = write(conn, cfg, "Grown", "small body", repo="r")
+    row = conn.execute("SELECT path, size FROM documents WHERE id=?", (doc_id,)).fetchone()
+    path = Path(row["path"])
+    text = path.read_text(errors="replace")
+    path.write_text(text + "x" * (MAX_READ_CHARS + 1 - len(text)))
+
+    assert row["size"] < MAX_READ_CHARS
+    assert len(path.read_text(errors="replace")) == MAX_READ_CHARS + 1
+    assert any(f.kind == "oversized" and f.document_id == doc_id for f in check(conn, cfg))
+
+
+def test_a_non_native_oversized_document_is_not_flagged(tmp_path, env):
+    """The oversized warning is scoped to native documents only."""
+    conn, cfg = env
+    root = tmp_path / "indexed"
+    doc = root / "sample-repo" / "notes" / "large.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text("x" * (MAX_READ_CHARS + 1))
+    cfg.index_roots = [IndexRoot(path=str(root), source="sample-notes")]
+    doc_id = index_path(conn, cfg, doc, "sample-notes", root=root)[0]
+
+    assert conn.execute("SELECT source FROM documents WHERE id=?", (doc_id,)).fetchone()["source"] == "sample-notes"
     assert not any(f.kind == "oversized" and f.document_id == doc_id for f in check(conn, cfg))
 
 

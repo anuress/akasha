@@ -225,21 +225,32 @@ def _knowledge_append(args: dict):
     _refuse_convention_edit(conn, args["id"])
     kb.append(conn, cfg, args["id"], args["text"], heading=args.get("heading"))
     _written(conn, "knowledge_append", args["id"])
-    row = conn.execute("SELECT path FROM documents WHERE id = ?", (args["id"],)).fetchone()
-    path = Path(row["path"])
-    size_warning = None
-    try:
-        if path.stat().st_size > fsck.MAX_READ_CHARS:
-            chars = len(path.read_text(errors="replace"))
-            if chars > fsck.MAX_READ_CHARS:
-                size_warning = (
-                    f"{chars} chars, over the {fsck.MAX_READ_CHARS}-char knowledge_get window; "
-                    f"write a summary with supersedes=[{args['id']}] instead of appending further")
-    except FileNotFoundError:
-        pass  # The append and event succeeded; a concurrent deletion leaves no size to report.
+    row = conn.execute("SELECT path, source FROM documents WHERE id = ?",
+                       (args["id"],)).fetchone()
     result = {"id": args["id"]}
-    if size_warning:
-        result["size_warning"] = size_warning
+    if row["source"] == "native":
+        path = Path(row["path"])
+        try:
+            file_stat = path.stat()
+        except FileNotFoundError:
+            pass  # The append and event succeeded; a concurrent deletion leaves no size to report.
+        except OSError as exc:
+            result["size_check_unavailable"] = (
+                f"append succeeded, but {type(exc).__name__} prevented the size check")
+        else:
+            if file_stat.st_size > fsck.MAX_READ_CHARS:
+                try:
+                    chars = len(path.read_text(errors="replace"))
+                except FileNotFoundError:
+                    pass  # The append and event succeeded; a concurrent deletion leaves no size to report.
+                except OSError as exc:
+                    result["size_check_unavailable"] = (
+                        f"append succeeded, but {type(exc).__name__} prevented the size check")
+                else:
+                    if chars > fsck.MAX_READ_CHARS:
+                        result["size_warning"] = (
+                            f"{chars} chars, over the {fsck.MAX_READ_CHARS}-char knowledge_get window; "
+                            f"write a summary with supersedes=[{args['id']}] instead of appending further")
     return result
 
 
