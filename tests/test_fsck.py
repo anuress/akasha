@@ -64,13 +64,16 @@ def test_a_native_document_under_the_get_window_is_not_flagged(env):
     assert "oversized" not in _kinds(check(conn, cfg))
 
 
-def test_size_prefilter_confirms_the_document_character_count(env):
-    """The cheap byte-size prefilter must not substitute for counting text characters."""
+def test_a_multibyte_file_under_the_get_char_window_is_not_flagged(env):
+    """Filesystem bytes can exceed the limit while decoded characters remain readable."""
     conn, cfg = env
-    doc_id = write(conn, cfg, "Short", "short body", repo="r")
-    conn.execute("UPDATE documents SET size=? WHERE id=?", (MAX_READ_CHARS + 1, doc_id))
-    conn.commit()
+    doc_id = write(conn, cfg, "Multibyte", "é" * (MAX_READ_CHARS // 2), repo="r")
+    path = Path(conn.execute("SELECT path FROM documents WHERE id=?",
+                             (doc_id,)).fetchone()["path"])
+    chars = len(path.read_text(errors="replace"))
 
+    assert path.stat().st_size > MAX_READ_CHARS
+    assert chars <= MAX_READ_CHARS
     assert not any(f.kind == "oversized" and f.document_id == doc_id for f in check(conn, cfg))
 
 
