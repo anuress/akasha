@@ -538,13 +538,26 @@ def test_doctor_output_is_bounded_and_says_what_was_cut(env, monkeypatch):
 
 # --- failures reach the caller as messages and the log as events -----------------------
 
-def test_an_error_result_is_recorded_and_returned_unchanged(env):
+def test_unknown_get_suggests_search_when_id_does_not_exist(env):
+    """An id copied from another session may not exist in this knowledge base."""
     conn, _ = env
     result = call_tool("knowledge_get", {"id": "bogus-id"})
-    assert result == {"error": "unknown document: bogus-id"}
+    assert result == {
+        "error": "unknown document: bogus-id; find it with knowledge_search "
+                 "(an id copied from another session or transcript may not exist here)"
+    }
     [event] = _events(conn, "tool.failed")
     assert (event["tool"], event["phase"]) == ("knowledge_get", "result")
     assert _events(conn, "knowledge.read") == []
+
+
+def test_unknown_append_suggests_search_when_id_does_not_exist(env):
+    """An append to a stale id should offer the same recovery path as a failed get."""
+    result = call_tool("knowledge_append", {"id": "bogus-id", "text": "more"})
+    assert result == {
+        "error": "unknown document: bogus-id; find it with knowledge_search "
+                 "(an id copied from another session or transcript may not exist here)"
+    }
 
 
 def test_a_read_only_document_refuses_writes_with_a_clear_message(env, tmp_path):

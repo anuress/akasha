@@ -116,7 +116,7 @@ def _knowledge_get(args: dict):
     conn, cfg = _ctx()
     row = conn.execute("SELECT * FROM documents WHERE id = ?", (args["id"],)).fetchone()
     if row is None:
-        return {"error": f"unknown document: {args['id']}"}
+        return {"error": kb.unknown_document_message(args["id"])}
     text = Path(row["path"]).read_text()
     # Indexing redacts the chunks; the file itself must not be a way around that. Applied
     # on the way out only, so the user's own notes are never rewritten.

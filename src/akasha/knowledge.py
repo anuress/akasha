@@ -62,10 +62,14 @@ def _register_custom_kind(conn: sqlite3.Connection, cfg: Config, kind: str) -> s
 def _slugify(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60] or "untitled"
 
+def unknown_document_message(doc_id: str) -> str:
+    return (f"unknown document: {doc_id}; find it with knowledge_search "
+            "(an id copied from another session or transcript may not exist here)")
+
 def _doc_row(conn: sqlite3.Connection, doc_id: str) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
     if row is None:
-        raise KeyError(f"unknown document: {doc_id}")
+        raise KeyError(unknown_document_message(doc_id))
     return row
 
 def get(conn: sqlite3.Connection, doc_id: str) -> sqlite3.Row:
