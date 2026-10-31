@@ -78,6 +78,12 @@ keeps saying so. `akasha config set embeddings.provider none` turns dense search
 existing config is never rewritten; to enable it there, set `embeddings.provider model2vec`
 and run `akasha index`.
 
+### Optional: pi
+
+pi users can add the [pi-akasha](https://github.com/anuress/pi-akasha) extension
+(`pi install git:github.com/anuress/pi-akasha`). It registers the MCP server and runs
+both hooks, including after compaction. `akasha init --all` does not configure pi.
+
 ## Quickstart
 
 ```sh
