@@ -1,8 +1,10 @@
+from pathlib import Path
+
 import pytest
 
 from akasha.config import load_config
 from akasha.db import connect
-from akasha.fsck import check
+from akasha.fsck import MAX_READ_CHARS, check
 from akasha.knowledge import write
 
 
@@ -33,6 +35,86 @@ def test_a_clean_base_reports_nothing(env):
     conn, cfg = env
     write(conn, cfg, "Only doc", "## A\ncontent here\n", repo="r")
     assert check(conn, cfg) == []
+
+
+def test_a_native_document_over_the_get_window_is_flagged(env):
+    """A document that needs multiple get calls should be visible to fsck."""
+    conn, cfg = env
+    doc_id = write(conn, cfg, "Large", "x" * (MAX_READ_CHARS + 1), repo="r")
+
+    findings = [f for f in check(conn, cfg) if f.kind == "oversized"]
+
+    assert len(findings) == 1
+    finding = findings[0]
+    path = conn.execute("SELECT path FROM documents WHERE id=?", (doc_id,)).fetchone()["path"]
+    chars = len(Path(path).read_text(errors="replace"))
+    assert finding.document_id == doc_id
+    assert finding.severity == "warning"
+    assert finding.detail == (
+        f"{chars} chars, over the {MAX_READ_CHARS}-char knowledge_get window; "
+        f"write a summary with supersedes=[{doc_id}] instead of appending further")
+
+
+def test_a_native_document_under_the_get_window_is_not_flagged(env):
+    """A normal-sized document should not add noise to fsck."""
+    conn, cfg = env
+    write(conn, cfg, "Small", "short body", repo="r")
+
+    assert "oversized" not in _kinds(check(conn, cfg))
+
+
+def test_size_prefilter_confirms_the_document_character_count(env):
+    """The cheap byte-size prefilter must not substitute for counting text characters."""
+    conn, cfg = env
+    doc_id = write(conn, cfg, "Short", "short body", repo="r")
+    conn.execute("UPDATE documents SET size=? WHERE id=?", (MAX_READ_CHARS + 1, doc_id))
+    conn.commit()
+
+    assert not any(f.kind == "oversized" and f.document_id == doc_id for f in check(conn, cfg))
+
+
+def test_an_archived_oversized_document_is_not_flagged(env):
+    """Archived documents are intentionally hidden and should not keep surfacing."""
+    conn, cfg = env
+    doc_id = write(conn, cfg, "Archived", "x" * (MAX_READ_CHARS + 1), repo="r")
+    conn.execute("UPDATE documents SET status='archived' WHERE id=?", (doc_id,))
+    conn.commit()
+
+    assert "oversized" not in _kinds(check(conn, cfg))
+
+
+def test_a_missing_oversized_file_reports_missing_not_oversized(env):
+    """A cached large size must not make fsck read a file that has vanished."""
+    conn, cfg = env
+    doc_id = write(conn, cfg, "Vanished", "x" * (MAX_READ_CHARS + 1), repo="r")
+    path = Path(conn.execute("SELECT path FROM documents WHERE id=?",
+                             (doc_id,)).fetchone()["path"])
+    path.unlink()
+
+    findings = [f for f in check(conn, cfg) if f.document_id == doc_id]
+
+    assert any(f.kind == "missing_file" for f in findings)
+    assert not any(f.kind == "oversized" for f in findings)
+
+
+def test_fsck_skips_a_file_removed_during_oversize_check(env, monkeypatch):
+    """A concurrent removal between file check and read should not abort fsck."""
+    conn, cfg = env
+    doc_id = write(conn, cfg, "Vanished", "x" * (MAX_READ_CHARS + 1), repo="r")
+    path = Path(conn.execute("SELECT path FROM documents WHERE id=?",
+                             (doc_id,)).fetchone()["path"])
+    read_text = Path.read_text
+
+    def remove_before_read(file, *args, **kwargs):
+        if file == path:
+            file.unlink()
+        return read_text(file, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", remove_before_read)
+
+    findings = [f for f in check(conn, cfg) if f.document_id == doc_id]
+
+    assert not any(f.kind == "oversized" for f in findings)
 
 
 def test_duplicate_titles_are_flagged(env):
@@ -88,7 +170,6 @@ def test_an_empty_document_is_flagged(env):
 
 def test_a_missing_file_on_disk_is_flagged(env):
     conn, cfg = env
-    from pathlib import Path
 
     doc_id = write(conn, cfg, "Vanished", "## A\ncontent\n", repo="r")
     path = conn.execute("SELECT path FROM documents WHERE id=?", (doc_id,)).fetchone()["path"]
@@ -432,8 +513,6 @@ def test_an_unlimited_report_withholds_nothing(env):
 
 def test_a_full_run_records_its_error_count_for_the_session_brief(env):
     """The session-start note reads this instead of running fsck on every session."""
-    from pathlib import Path
-
     from akasha.fsck import cached_error_count, report
 
     conn, cfg = env
@@ -447,8 +526,6 @@ def test_a_full_run_records_its_error_count_for_the_session_brief(env):
 
 def test_the_recorded_error_count_ignores_the_display_limit(env):
     """A limit of zero shows no findings, and the recorded count must still be the truth."""
-    from pathlib import Path
-
     from akasha.fsck import cached_error_count, report
 
     conn, cfg = env

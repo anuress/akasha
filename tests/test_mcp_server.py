@@ -11,6 +11,7 @@ from akasha import mcp_server
 from akasha.config import load_config
 from akasha.db import connect
 from akasha.events import recent
+from akasha.fsck import MAX_READ_CHARS
 from akasha.mcp_server import TOOLS, call_tool
 
 KEPT_TOOLS = {
@@ -216,6 +217,53 @@ def test_write_tools_emit_a_written_event(env):
     events = _events(conn, "knowledge.written")          # newest first
     assert [(e["tool"], e["document"]) for e in events] == [
         ("knowledge_append", doc["id"]), ("knowledge_write", doc["id"])]
+
+
+def test_append_that_crosses_the_get_window_returns_a_size_warning(env):
+    """The writer should hear when its append makes one-call retrieval impossible."""
+    conn, _ = env
+    doc = call_tool("knowledge_write", {"title": "Large", "body": "small", "repo": "r"})
+
+    result = call_tool("knowledge_append", {
+        "id": doc["id"], "text": "x" * MAX_READ_CHARS})
+
+    path = conn.execute("SELECT path FROM documents WHERE id=?",
+                        (doc["id"],)).fetchone()["path"]
+    chars = len(Path(path).read_text(errors="replace"))
+    assert result == {
+        "id": doc["id"],
+        "size_warning": f"{chars} chars, over the {MAX_READ_CHARS}-char knowledge_get window; "
+                        f"write a summary with supersedes=[{doc['id']}] instead of "
+                        "appending further",
+    }
+
+
+def test_append_to_a_small_document_keeps_the_existing_response(env):
+    """Small appends keep the stable response shape without an empty warning."""
+    doc = call_tool("knowledge_write", {"title": "Small", "body": "small", "repo": "r"})
+
+    assert call_tool("knowledge_append", {"id": doc["id"], "text": "still small"}) == {
+        "id": doc["id"]}
+
+
+def test_append_still_returns_id_if_the_file_disappears_after_write(env, monkeypatch):
+    """A post-write size check must not turn a successful append into a retryable error."""
+    conn, _ = env
+    doc = call_tool("knowledge_write", {"title": "Vanished", "body": "small", "repo": "r"})
+    path = conn.execute("SELECT path FROM documents WHERE id=?",
+                        (doc["id"],)).fetchone()["path"]
+    append = mcp_server.kb.append
+
+    def append_then_remove(*args, **kwargs):
+        append(*args, **kwargs)
+        Path(path).unlink()
+
+    monkeypatch.setattr(mcp_server.kb, "append", append_then_remove)
+
+    result = call_tool("knowledge_append", {"id": doc["id"], "text": "still small"})
+
+    assert result == {"id": doc["id"]}
+    assert _events(conn, "knowledge.written")[0]["tool"] == "knowledge_append"
 
 
 def test_search_scrubs_an_instruction_span_and_records_the_document(env):

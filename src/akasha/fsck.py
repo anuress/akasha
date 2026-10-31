@@ -18,6 +18,8 @@ from akasha.links import FENCE_BLOCK
 from akasha.markdown import parse_frontmatter
 
 NEAR_DUPLICATE_COSINE = 0.92
+# A document above knowledge_get's default window needs another call.
+MAX_READ_CHARS = 20000
 DEFAULT_LIMIT = 50
 ERRORS_KEY = "fsck.errors"
 
@@ -225,6 +227,22 @@ def check(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:
             severity = "error" if row["source"] == "native" else "warning"
             findings.append(Finding("missing_file", severity, row["id"],
                                     f"indexed but absent from disk: {row['path']}"))
+
+    for row in conn.execute(
+        "SELECT id, path FROM documents"
+        " WHERE deleted_at IS NULL AND source = 'native' AND status != 'archived'"
+        " AND size > ?", (MAX_READ_CHARS,)
+    ):
+        file = Path(row["path"])
+        try:
+            chars = len(file.read_text(errors="replace"))
+        except FileNotFoundError:
+            continue             # missing_file reports it, including a concurrent removal
+        if chars > MAX_READ_CHARS:
+            findings.append(Finding(
+                "oversized", "warning", row["id"],
+                f"{chars} chars, over the {MAX_READ_CHARS}-char knowledge_get window; "
+                f"write a summary with supersedes=[{row['id']}] instead of appending further"))
 
     # Code anchors that no longer resolve. `info`: a moved file is ordinary work, not
     # corruption. The body is read from disk rather than rebuilt from the chunks, which

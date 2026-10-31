@@ -41,7 +41,7 @@ def _resolved_repo(cfg: Config, args: dict) -> str | None:
 # contract. These ceilings only bite on the pathological case (a single chunk can be
 # megabytes); ordinary results pass untouched.
 MAX_HIT_CHARS = 2000
-MAX_DOC_CHARS = 20000
+MAX_DOC_CHARS = fsck.MAX_READ_CHARS
 MAX_FINDINGS = 50
 FSCK_LIMIT = 10
 TIMELINE_LIMIT = 15
@@ -225,7 +225,22 @@ def _knowledge_append(args: dict):
     _refuse_convention_edit(conn, args["id"])
     kb.append(conn, cfg, args["id"], args["text"], heading=args.get("heading"))
     _written(conn, "knowledge_append", args["id"])
-    return {"id": args["id"]}
+    row = conn.execute("SELECT path FROM documents WHERE id = ?", (args["id"],)).fetchone()
+    path = Path(row["path"])
+    size_warning = None
+    try:
+        if path.stat().st_size > fsck.MAX_READ_CHARS:
+            chars = len(path.read_text(errors="replace"))
+            if chars > fsck.MAX_READ_CHARS:
+                size_warning = (
+                    f"{chars} chars, over the {fsck.MAX_READ_CHARS}-char knowledge_get window; "
+                    f"write a summary with supersedes=[{args['id']}] instead of appending further")
+    except FileNotFoundError:
+        pass  # The append and event succeeded; a concurrent deletion leaves no size to report.
+    result = {"id": args["id"]}
+    if size_warning:
+        result["size_warning"] = size_warning
+    return result
 
 
 def _knowledge_archive(args: dict):
