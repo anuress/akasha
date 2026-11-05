@@ -5,7 +5,10 @@ cell, so the suite needs no real export and no real knowledge base.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
+import os
+import threading
 
 import pytest
 
@@ -59,6 +62,17 @@ def _cell_ids(conn, doc_id):
 
 def _boom(*_args, **_kwargs):
     raise RuntimeError("reindex exploded")
+
+
+def _xlsx(tmp_path, name="prices.xlsx", rows=(("item", "price"), ("bolt", 4), ("nut", 2))):
+    openpyxl = pytest.importorskip("openpyxl")
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    for row in rows:
+        sheet.append(list(row))
+    path = tmp_path / name
+    workbook.save(path)
+    return path
 
 
 def test_first_feed_copies_file_writes_doc_with_settings_and_unit_chunks(env, source):
@@ -251,26 +265,19 @@ def test_failed_first_feed_leaves_no_copy_and_no_document(env, source, monkeypat
 
     assert not _copy(cfg).exists()
     assert not _doc(cfg).exists()
-    assert list((cfg.knowledge_dir.parent / "files").rglob("*.tmp")) == []
+    assert list((cfg.knowledge_dir.parent / "files").rglob("*.staging*")) == []
     assert feed_store.load_units(conn, "prices") == []
 
 
 def test_feed_switching_extension_trashes_old_copy(env, source, tmp_path):
     """The copy's extension follows the incoming file, so the previous copy has no name to
     live at any more and goes to the trash instead of being overwritten."""
-    openpyxl = pytest.importorskip("openpyxl")
     conn, cfg = env
     settings = FeedSettings(key="item")
     feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
     old_bytes = _copy(cfg).read_bytes()
 
-    workbook = openpyxl.Workbook()
-    sheet = workbook.active
-    sheet.append(["item", "price"])
-    sheet.append(["bolt", 4])
-    sheet.append(["nut", 2])
-    book = tmp_path / "prices.xlsx"
-    workbook.save(book)
+    book = _xlsx(tmp_path)
 
     result = feed.feed(conn, cfg, book, "prices", settings, repo="sample-repo")
 
@@ -286,19 +293,13 @@ def test_failed_extension_switch_restores_the_old_copy_and_drops_the_new_one(
         env, source, tmp_path, monkeypatch):
     """A failed feed that changed the extension leaves two names in play, so the rollback
     must delete the new copy and restore the old one: a stray copy is a torn feed too."""
-    openpyxl = pytest.importorskip("openpyxl")
     conn, cfg = env
     settings = FeedSettings(key="item")
     feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
     copy_before = _copy(cfg).read_bytes()
     doc_before = _doc(cfg).read_text()
 
-    workbook = openpyxl.Workbook()
-    sheet = workbook.active
-    sheet.append(["item", "price"])
-    sheet.append(["bolt", 4])
-    book = tmp_path / "prices.xlsx"
-    workbook.save(book)
+    book = _xlsx(tmp_path, rows=(("item", "price"), ("bolt", 4)))
 
     monkeypatch.setattr(knowledge, "_reindex", _boom)
     with pytest.raises(RuntimeError, match="reindex exploded"):
@@ -412,3 +413,190 @@ def test_large_file_warns(env, source, monkeypatch):
     assert len(result.warnings) == 1
     assert result.warnings[0].startswith("prices.csv is ")
     assert result.warnings[0].endswith(" MB; feeding anyway")
+
+
+def test_splitter_warnings_are_reported(env, source):
+    """A duplicate key falls back to the locator, so the rows are addressed differently
+    than the settings promise; the splitter's warning has to reach the caller."""
+    conn, cfg = env
+
+    result = feed.feed(conn, cfg, source(rows="item,price\nbolt,4\nbolt,2\n"), "prices",
+                       FeedSettings(key="item"), repo="sample-repo")
+
+    assert any("duplicate" in warning for warning in result.warnings)
+    assert [unit.key for unit in feed_store.load_units(conn, "prices")] == [None, None]
+
+
+def test_refeed_after_copy_deleted_restores_copy(env, source):
+    """A deleted copy is never unchanged: re-feeding the source must write it again."""
+    conn, cfg = env
+    src = source()
+    settings = FeedSettings(key="item")
+    feed.feed(conn, cfg, src, "prices", settings, repo="sample-repo")
+    _copy(cfg).unlink()
+
+    result = feed.feed(conn, cfg, src, "prices", settings, repo="sample-repo")
+
+    assert result.unchanged is False
+    assert _copy(cfg).read_bytes() == src.read_bytes()
+
+
+def test_attach_failure_during_feed_rolls_back(env, source, monkeypatch):
+    """attach records a data problem instead of raising; for a feed the units it stored
+    were not the ones attached, so the feed must roll back and raise."""
+    conn, cfg = env
+    settings = FeedSettings(key="item")
+    feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
+    doc_before = _doc(cfg).read_text()
+    copy_before = _copy(cfg).read_bytes()
+    units_before = feed_store.load_units(conn, "prices")
+
+    def broken_attach(conn, cfg, doc_id, meta, **kwargs):
+        feed.ATTACH_ERRORS.append((meta["dataset"], "cannot read the copy"))
+        return 0
+
+    monkeypatch.setattr(feed, "ATTACH_ERRORS", [])
+    monkeypatch.setattr(feed, "attach", broken_attach)
+    with pytest.raises(ValueError, match="cannot read the copy"):
+        feed.feed(conn, cfg, source(rows="item,price\nbolt,9\n"), "prices", settings,
+                  repo="sample-repo")
+
+    assert _copy(cfg).read_bytes() == copy_before
+    assert _doc(cfg).read_text() == doc_before
+    assert feed_store.load_units(conn, "prices") == units_before
+    assert conn.in_transaction is False
+
+
+def test_header_named_change_log_does_not_corrupt_carried_log(env, source):
+    """A column named `## Change log` sits in the fields list, so carrying the old log by
+    searching the raw text would splice the whole document into the carried part."""
+    conn, cfg = env
+    settings = FeedSettings(key="price")
+    rows = "## Change log,price\nbolt,4\nnut,2\n"
+    feed.feed(conn, cfg, source(rows=rows), "prices", settings, repo="sample-repo")
+    feed.feed(conn, cfg, source(rows=rows + "screw,1\n"), "prices", settings,
+              repo="sample-repo")
+
+    body = _doc(cfg).read_text()
+    assert body.count("## How to read rows") == 1
+    log = body.split("## Change log", 1)[1]
+    assert log.count("### ") == 2
+    assert "first feed: 2 units" in log
+    assert "+1 -0 ~0" in log
+
+
+def test_post_commit_cleanup_failure_is_a_warning(env, source, tmp_path, monkeypatch):
+    """By then the feed has committed, so a failing trash move is reported, not raised:
+    raising would tell the caller nothing landed when everything did."""
+    conn, cfg = env
+    settings = FeedSettings(key="item")
+    feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
+    book = _xlsx(tmp_path)
+    real_replace = os.replace
+
+    def flaky_replace(src, dst):
+        if ".trash" in str(dst):
+            raise OSError("trash is full")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(feed.os, "replace", flaky_replace)
+
+    result = feed.feed(conn, cfg, book, "prices", settings, repo="sample-repo")
+
+    assert result.copy == _copy(cfg, suffix=".xlsx")
+    assert any("trash is full" in warning for warning in result.warnings)
+    assert [unit.key for unit in feed_store.load_units(conn, "prices")] == ["bolt", "nut"]
+
+
+def test_failed_second_backup_rename_restores_first(env, source, tmp_path, monkeypatch):
+    """An extension switch renames two copies aside; a failure on the second must still
+    put the first back, or the rollback loses a copy it never recorded."""
+    conn, cfg = env
+    settings = FeedSettings(key="item")
+    feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
+    csv_before = _copy(cfg).read_bytes()
+    stale = _copy(cfg, suffix=".xlsx")
+    stale.write_text("not even a workbook", encoding="utf-8")
+    doc_before = _doc(cfg).read_text()
+
+    real_replace = os.replace
+
+    def flaky_replace(src, dst):
+        if str(src).endswith("prices.xlsx"):
+            raise OSError("disk went away")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(feed.os, "replace", flaky_replace)
+    with pytest.raises(OSError, match="disk went away"):
+        feed.feed(conn, cfg, _xlsx(tmp_path), "prices", settings, repo="sample-repo")
+
+    assert _copy(cfg).read_bytes() == csv_before
+    assert _doc(cfg).read_text() == doc_before
+    assert not list((cfg.knowledge_dir.parent / "files").rglob("*.bak"))
+
+
+def test_failed_final_replace_restores_old_copy_and_removes_tmp(env, source, tmp_path,
+                                                                 monkeypatch):
+    """The swap into place is the last file step, so its failure must leave the old copy
+    and no staging or temporary file behind: a partial copy is a torn feed."""
+    conn, cfg = env
+    settings = FeedSettings(key="item")
+    feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
+    csv_before = _copy(cfg).read_bytes()
+    doc_before = _doc(cfg).read_text()
+    units_before = feed_store.load_units(conn, "prices")
+
+    real_replace = os.replace
+
+    def flaky_replace(src, dst):
+        if str(src).endswith(".staging.xlsx"):
+            raise OSError("swap failed")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(feed.os, "replace", flaky_replace)
+    with pytest.raises(OSError, match="swap failed"):
+        feed.feed(conn, cfg, _xlsx(tmp_path), "prices", settings, repo="sample-repo")
+
+    files = cfg.knowledge_dir.parent / "files"
+    assert _copy(cfg).read_bytes() == csv_before
+    assert _doc(cfg).read_text() == doc_before
+    assert feed_store.load_units(conn, "prices") == units_before
+    assert not list(files.rglob("*.staging*"))
+    assert not list(files.rglob("*.tmp"))
+    assert not list(files.rglob("*.bak"))
+
+
+def test_second_feed_of_same_name_waits_for_lock(env, source, tmp_path):
+    """Two feeds of one name share the staging, backup and copy paths before the database
+    lock, so the second has to wait for the first rather than trade files with it."""
+    conn, cfg = env
+    src = source()
+    settings = FeedSettings(key="item")
+    hold = feed._lock(cfg, "prices")
+    started = threading.Event()
+    done = threading.Event()
+    outcome: list = []
+
+    def run():
+        worker = connect(tmp_path / "s.db")
+        started.set()
+        try:
+            outcome.append(feed.feed(worker, cfg, src, "prices", settings,
+                                     repo="sample-repo"))
+        except BaseException as exc:
+            outcome.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert started.wait(5) is True        # the worker reached the feed call
+        assert done.wait(0.3) is False        # blocked on the lock this test holds
+    finally:
+        fcntl.flock(hold.fileno(), fcntl.LOCK_UN)
+        hold.close()
+    assert done.wait(10) is True
+    thread.join()
+    assert isinstance(outcome[0], feed.FeedResult)
+    assert outcome[0].units == 2

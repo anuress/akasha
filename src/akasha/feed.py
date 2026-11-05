@@ -11,13 +11,16 @@ entirely or leaves the previous feed untouched.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import IO
 
 from akasha import feed_store, gitctx, kinds, knowledge, markdown, splitters, vectors
 from akasha.config import Config
@@ -47,6 +50,9 @@ LARGE_FILE_BYTES = 50 * 1024 * 1024
 CHANGE_LINE_CAP = 50
 
 CHANGE_LOG = "## Change log"
+
+# The heading line, not that text anywhere: a field may itself be named `## Change log`.
+CHANGE_LOG_LINE = re.compile(r"^## Change log$", re.MULTILINE)
 
 
 class DatasetReadOnly(ValueError):
@@ -225,6 +231,25 @@ def _copy_path(cfg: Config, repo: str, name: str, suffix: str) -> Path:
     return cfg.knowledge_dir.parent / "files" / repo / f"{name}{suffix}"
 
 
+def _staging_path(cfg: Config, repo: str, name: str, suffix: str) -> Path:
+    """Staged beside the copy with a real extension, so the splitter dispatches on it."""
+    return cfg.knowledge_dir.parent / "files" / repo / f"{name}.staging{suffix}"
+
+
+def _lock(cfg: Config, name: str) -> IO[str]:
+    """One feed of a name at a time.
+
+    Two feeds of one name would trade the staging, backup and copy paths with each other
+    before either reaches the database lock, so one caller's bytes could end up under the
+    other caller's document. The lock file outlives the call; `flock` does not.
+    """
+    path = cfg.knowledge_dir.parent / "files" / ".locks" / f"{name}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    return handle
+
+
 def _dataset_doc(cfg: Config, name: str) -> Path | None:
     """The dataset document of a name, whichever repo folder holds it.
 
@@ -271,8 +296,9 @@ def _change_line(change: Change) -> str:
 def _change_section(units: int, changes: Diff | None) -> str:
     """One dated section: what the feed counted, then what moved.
 
-    Lines carry identities and field names only. A cell value would grow the log without
-    bound and put into a document what redaction exists to keep out of one.
+    A line carries the identity and the label of a row plus the names of the fields that
+    changed; a cell value would grow the log without bound and put into a document what
+    redaction exists to keep out of one.
     """
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     lines = [f"### {stamp}"]
@@ -289,16 +315,21 @@ def _change_section(units: int, changes: Diff | None) -> str:
     return "\n".join(lines)
 
 
-def _earlier_sections(previous_body: str | None) -> str:
-    """The change log of the document being replaced, carried below the new section."""
-    if not previous_body:
+def _earlier_sections(previous_text: str | None) -> str:
+    """The change log of the document being replaced, carried below the new section.
+
+    The body only, and by a heading line: a field called `## Change log` sits inside the
+    fields list, and searching the whole text would carry the rest of the document along.
+    """
+    if not previous_text:
         return ""
-    marker = previous_body.find(CHANGE_LOG)
-    return previous_body[marker + len(CHANGE_LOG):].strip("\n") if marker >= 0 else ""
+    _meta, body = markdown.parse_frontmatter(previous_text)
+    match = CHANGE_LOG_LINE.search(body)
+    return body[match.end():].strip("\n") if match else ""
 
 
 def _doc_body(name: str, original: str, units: list[Unit], headers: list[str],
-              changes: Diff | None, previous_body: str | None) -> str:
+              changes: Diff | None, previous_text: str | None) -> str:
     today = datetime.now(timezone.utc).date().isoformat()
     sections = [
         f"Fed from {original} on {today}: {len(units)} units, {len(headers)} fields.",
@@ -311,19 +342,19 @@ def _doc_body(name: str, original: str, units: list[Unit], headers: list[str],
         CHANGE_LOG,
         _change_section(len(units), changes),
     ]
-    earlier = _earlier_sections(previous_body)
+    earlier = _earlier_sections(previous_text)
     if earlier:
         sections.append(earlier)
     return "\n\n".join(sections) + "\n"
 
 
-def _move_copies_aside(cfg: Config, repo: str, name: str) -> list[tuple[Path, Path]]:
+def _move_copies_aside(cfg: Config, repo: str, name: str,
+                       moved: list[tuple[Path, Path]]) -> None:
     """Rename every copy of this name out of the way, whichever extension it has.
 
-    A feed that changes the extension leaves the old copy with no name to live at, so the
-    backup is what the rollback restores and what the caller trashes afterwards.
+    Recorded in `moved` as each rename succeeds, so a failure halfway leaves the caller a
+    partial list, which is exactly what its rollback restores from.
     """
-    moved: list[tuple[Path, Path]] = []
     for suffix in ALLOWED_SUFFIXES:
         old = _copy_path(cfg, repo, name, suffix)
         if not old.exists():
@@ -331,7 +362,6 @@ def _move_copies_aside(cfg: Config, repo: str, name: str) -> list[tuple[Path, Pa
         backup = Path(f"{old}.bak")
         os.replace(old, backup)
         moved.append((backup, old))
-    return moved
 
 
 def feed(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
@@ -341,12 +371,22 @@ def feed(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
     Order matters for crash safety: everything that can refuse the file happens before a
     byte is written, the copy and the document are written outside the transaction (a file
     cannot be rolled back), and the unit rows, the document row and its chunks land in one
-    transaction whose failure restores the files it replaced.
+    transaction whose failure restores every file it touched.
     """
     path = Path(path)
     reason = kinds.custom_kind_error(name)
     if reason is not None:
         raise ValueError(f"invalid dataset name {name!r}: {reason}")
+    handle = _lock(cfg, name)
+    try:
+        return _feed_locked(conn, cfg, path, name, settings, repo)
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
+                 settings: FeedSettings | None, repo: str | None) -> FeedResult:
     if not path.is_file():
         raise FileNotFoundError(f"{path} does not exist")
     suffix = path.suffix.lower()
@@ -383,46 +423,55 @@ def feed(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
     indexed = conn.execute(
         "SELECT id FROM documents WHERE path = ? AND deleted_at IS NULL",
         (str(doc_path),)).fetchone()
-    if (existing is not None and indexed is not None and stored
-            and feed_store.stored_state(conn, name) == state):
+    if (existing is not None and indexed is not None
+            and feed_store.stored_state(conn, name) == state
+            and copy.is_file() and hashlib.sha256(copy.read_bytes()).hexdigest() == file_sha):
+        # A copy deleted behind akasha's back is not "unchanged": falling through to a
+        # normal feed is the repair the fsck finding points at.
         return FeedResult(name=name, repo=resolved_repo, doc_id=indexed["id"], copy=copy,
                           units=len(stored), diff=None, unchanged=True, renamed=[],
                           warnings=warnings, redacted=0)
 
-    split_result = splitters.split(path, name, settings)
-    units, redacted = redact_units(split_result.units, cfg)
-    changes = feed_store.diff(stored, units) if existing is not None else None
-    if "dataset" not in cfg.custom_kinds:
-        # Before the transaction: registering rewrites the config file and commits its
-        # event, neither of which a rollback of the dataset could undo.
-        knowledge._register_custom_kind(conn, cfg, "dataset")
-    meta = {
-        "title": f"Dataset: {name}",
-        "kind": "dataset",
-        "feature": name,
-        "repo": resolved_repo,
-        "dataset": name,
-        "file": str(copy),
-        "sha256": file_sha,
-        "settings_sha256": settings.sha256(),
-        "settings": json.loads(settings.to_json()),
-    }
-    text = markdown.render(
-        meta, _doc_body(name, path.name, units, split_result.headers, changes, previous_text))
-
-    copy.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(f"{copy}.tmp")
-    tmp.write_bytes(data)
-    backups = _move_copies_aside(cfg, resolved_repo, name)
-    os.replace(tmp, copy)
-    attach_failures_before = len(ATTACH_ERRORS)
+    staging = _staging_path(cfg, resolved_repo, name, suffix)
+    backups: list[tuple[Path, Path]] = []
+    failures_before = len(ATTACH_ERRORS)
+    swapped = False
     try:
+        staging.parent.mkdir(parents=True, exist_ok=True)
+        # One snapshot: the hash above, the split below and the copy that is installed all
+        # describe these bytes, even when the source changes while the feed runs.
+        staging.write_bytes(data)
+        split_result = splitters.split(staging, name, settings)
+        warnings.extend(split_result.warnings)
+        units, redacted = redact_units(split_result.units, cfg)
+        changes = feed_store.diff(stored, units) if existing is not None else None
+        if "dataset" not in cfg.custom_kinds:
+            # Before the transaction: registering rewrites the config file and commits its
+            # event, neither of which a rollback of the dataset could undo.
+            knowledge._register_custom_kind(conn, cfg, "dataset")
+        meta = {
+            "title": f"Dataset: {name}",
+            "kind": "dataset",
+            "feature": name,
+            "repo": resolved_repo,
+            "dataset": name,
+            "file": str(copy),
+            "sha256": file_sha,
+            "settings_sha256": settings.sha256(),
+            "settings": json.loads(settings.to_json()),
+        }
+        text = markdown.render(
+            meta, _doc_body(name, path.name, units, split_result.headers, changes,
+                            previous_text))
+        _move_copies_aside(cfg, resolved_repo, name, backups)
+        os.replace(staging, copy)
+        swapped = True
         conn.execute("BEGIN IMMEDIATE")
         feed_store.replace_units(conn, name, units, state)
         doc_path.parent.mkdir(parents=True, exist_ok=True)
         doc_path.write_text(text)
         knowledge._reindex(conn, cfg, doc_path, commit=False)
-        failures = [message for dataset, message in ATTACH_ERRORS[attach_failures_before:]
+        failures = [message for dataset, message in ATTACH_ERRORS[failures_before:]
                     if dataset == name]
         if failures:
             # attach records a data problem and keeps the last good units; for a feed, the
@@ -434,11 +483,11 @@ def feed(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
             conn.execute("ROLLBACK")
         # A backup restores its own name, so unlinking the new copy is right unless one of
         # them is that name: a feed that changed the extension renamed the old copy away.
-        if all(original != copy for _backup, original in backups):
+        if swapped and all(original != copy for _backup, original in backups):
             copy.unlink(missing_ok=True)
         for backup, original in backups:
             os.replace(backup, original)
-        tmp.unlink(missing_ok=True)
+        staging.unlink(missing_ok=True)
         if previous_text is None:
             doc_path.unlink(missing_ok=True)
         else:
@@ -446,15 +495,22 @@ def feed(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
         raise
 
     for backup, original in backups:
-        if original == copy:
-            backup.unlink(missing_ok=True)
-        else:
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-            trashed = (cfg.knowledge_dir.parent / "files" / ".trash" / resolved_repo
-                       / f"{name}-{stamp}{original.suffix}")
-            trashed.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(backup, trashed)
-    vectors.index_chunks(conn, cfg)
+        try:
+            if original == copy:
+                backup.unlink(missing_ok=True)
+            else:
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                trashed = (cfg.knowledge_dir.parent / "files" / ".trash" / resolved_repo
+                           / f"{name}-{stamp}{original.suffix}")
+                trashed.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(backup, trashed)
+        except OSError as exc:
+            # The feed has landed; a leftover backup can only be reported, not undone.
+            warnings.append(f"left {backup.name} behind: {exc}")
+    try:
+        vectors.index_chunks(conn, cfg)
+    except Exception as exc:                                     # noqa: BLE001
+        warnings.append(f"vectors not updated: {exc}")
 
     row = conn.execute("SELECT id FROM documents WHERE path = ?",
                        (str(doc_path),)).fetchone()
