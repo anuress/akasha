@@ -53,6 +53,7 @@ class IndexStats:
     links_resolved: int = 0
     vectors: int = 0
     collisions: list[tuple[str, str]] = field(default_factory=list)
+    dataset_errors: list[tuple[str, str]] = field(default_factory=list)
 
 
 def _guess_kind(path: Path) -> str:

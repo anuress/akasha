@@ -1,23 +1,26 @@
 """Attach a dataset's units to its document as search chunks, rebuilding them if stale.
 
 The units are the dataset's cells; search reads the chunks made from them. Splitting is
-the expensive part, so it happens only when the copy or its settings changed. Nothing here
-commits: an attach belongs in the caller's transaction, together with the document row and
-the chunks it replaces. A broken dataset must never stop an index run, so its data
-problems are recorded and reported instead of raised.
+the expensive part, so it happens only when the copy, its settings or the scan policy
+changed. Nothing here commits: an attach belongs in the caller's transaction, together
+with the document row and the chunks it replaces. A broken dataset must never stop an
+index run, so its data problems are recorded and reported instead of raised.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from pathlib import Path
 
 from akasha import feed_store, splitters
 from akasha.config import Config
 from akasha.events import emit
-from akasha.security import redact, scrub_injection
+from akasha.security import (INJECTION_PATTERNS, INJECTION_STRIP_RULES, SECRET_PATTERNS,
+                             redact, scrub_injection)
 from akasha.splitters import FeedSettings, Unit
 
-__all__ = ["ATTACH_ERRORS", "DatasetReadOnly", "attach", "redact_units"]
+__all__ = ["ATTACH_ERRORS", "DatasetReadOnly", "attach", "redact_units", "unit_state"]
 
 
 class DatasetReadOnly(ValueError):
@@ -31,35 +34,83 @@ class DatasetReadOnly(ValueError):
 ATTACH_ERRORS: list[tuple[str, str]] = []
 
 
-def redact_units(units: list[Unit], cfg: Config) -> tuple[list[Unit], int]:
-    """Scrub every cell, as the markdown body is scrubbed on the way in.
+def _scrub(value: str) -> str:
+    cleaned, _hits = redact(value)
+    cleaned, _injections = scrub_injection(cleaned)
+    return cleaned
 
-    The count is the number of cells that changed, which is what tells the caller that a
-    dataset held something secret-shaped.
+
+def redact_units(units: list[Unit], cfg: Config) -> tuple[list[Unit], int]:
+    """Scrub every stored string of a unit: each cell, the key and the label.
+
+    The label is built from cells (excluded columns included) and both it and the key are
+    stored and shown in a search result, so scrubbing only `fields` would leak through
+    them. The count is the number of values that changed, which is what tells `feed add`
+    how much it scrubbed.
     """
     if not cfg.scan_secrets:
         return units, 0
     changed = 0
     cleaned: list[Unit] = []
     for unit in units:
-        fields: dict[str, str] = {}
-        for name, value in unit.fields.items():
-            value, _hits = redact(value)
-            value, _injections = scrub_injection(value)
-            if value != unit.fields[name]:
-                changed += 1
-            fields[name] = value
-        cleaned.append(unit._replace(fields=fields))
+        key = _scrub(unit.key) if unit.key is not None else None
+        label = _scrub(unit.label)
+        fields = {name: _scrub(value) for name, value in unit.fields.items()}
+        changed += ((key != unit.key) + (label != unit.label)
+                    + sum(fields[name] != value for name, value in unit.fields.items()))
+        cleaned.append(unit._replace(key=key, label=label, fields=fields))
     return cleaned, changed
 
 
-def _settings_from(meta: dict) -> FeedSettings:
+def unit_state(file_sha: str, settings_sha: str, cfg: Config) -> str:
+    """What the stored units are: the copy, its settings, and the scan policy of the run.
+
+    The policy belongs in it because the same copy and settings must be split again once
+    secret scanning is turned on, or units stored raw would look current forever.
+    """
+    policy = (
+        cfg.scan_secrets,
+        [(name, pattern.pattern) for name, pattern in SECRET_PATTERNS],
+        [(name, pattern.pattern) for name, pattern in INJECTION_PATTERNS],
+        sorted(INJECTION_STRIP_RULES),
+    )
+    digest = hashlib.sha256(json.dumps(policy).encode()).hexdigest()
+    return f"{file_sha}:{settings_sha}:{digest[:12]}"
+
+
+def _bad_settings(name: str, detail: str) -> str:
+    return f"dataset '{name}': invalid settings: {detail}"
+
+
+def _settings_from(meta: dict, name: str) -> FeedSettings:
     """The frontmatter carries the settings as real JSON when the file was written by
-    `feed`; an older hand-written doc may carry the string form."""
+    `feed`; an older hand-written doc may carry the string form.
+
+    Validated because frontmatter is data: handing it straight to `FeedSettings` raises
+    `TypeError`, which would end the whole index run instead of one dataset.
+    """
     raw = meta.get("settings")
-    if isinstance(raw, dict):
-        return FeedSettings(**raw)
-    return FeedSettings.from_json(str(raw))
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raise ValueError(_bad_settings(name, "not a JSON object")) from None
+    if not isinstance(raw, dict):
+        raise ValueError(_bad_settings(name, "not an object"))
+    unknown = sorted(set(raw) - set(FeedSettings.__dataclass_fields__))
+    if unknown:
+        raise ValueError(_bad_settings(name, f"unknown key {', '.join(map(repr, unknown))}"))
+    for key in ("key", "sheet", "label"):
+        if raw.get(key) is not None and not isinstance(raw[key], str):
+            raise ValueError(_bad_settings(name, f"{key} must be a string or null"))
+    for key in ("require", "exclude"):
+        value = raw.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ValueError(_bad_settings(name, f"{key} must be a list of strings"))
+    header_row = raw.get("header_row", 1)
+    if isinstance(header_row, bool) or not isinstance(header_row, int) or header_row < 1:
+        raise ValueError(_bad_settings(name, "header_row must be an integer >= 1"))
+    return FeedSettings(**raw)
 
 
 def _insert_chunks(conn: sqlite3.Connection, doc_id: str, name: str,
@@ -72,11 +123,16 @@ def _insert_chunks(conn: sqlite3.Connection, doc_id: str, name: str,
     count = 0
     for unit in units:
         for field, value in unit.fields.items():
-            chunk_id = feed_store.unit_chunk_id(name, unit.locator, field, value)
-            # Replacing rather than inserting: a dataset doc that moved gets a new document
-            # row, and the same cell keeps the same content-derived id.
+            # The label is part of the id because it is part of the embedded text: a
+            # relabelled cell must not keep the vector of its old label.
+            chunk_id = feed_store.unit_chunk_id(name, unit.locator, field,
+                                                f"{unit.label}\0{value}")
+            # Delete before insert: a REPLACE conflict does not fire `chunks_ad`, so the
+            # FTS row of the old text would survive the rowid being reused and the same
+            # term would match a chunk that no longer holds it.
+            conn.execute("DELETE FROM chunks WHERE id = ?", (chunk_id,))
             conn.execute(
-                "INSERT OR REPLACE INTO chunks (id, document_id, title, heading, body, ord)"
+                "INSERT INTO chunks (id, document_id, title, heading, body, ord)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
                 (chunk_id, doc_id, title, f"{unit.locator} · {field}",
                  f"{unit.label} · {field}: {value}", start + count))
@@ -101,7 +157,7 @@ def attach(conn: sqlite3.Connection, cfg: Config, doc_id: str, meta: dict, *,
     # chunks; only the mapping that says which of them were a cell survives here.
     conn.execute("DELETE FROM feed_chunks WHERE dataset = ?", (name,))
     try:
-        state = f"{meta['sha256']}:{meta['settings_sha256']}"
+        state = unit_state(meta["sha256"], meta["settings_sha256"], cfg)
         if units is None:
             stored = feed_store.load_units(conn, name)
             if feed_store.stored_state(conn, name) == state and stored:
@@ -109,7 +165,7 @@ def attach(conn: sqlite3.Connection, cfg: Config, doc_id: str, meta: dict, *,
             else:
                 units, _redacted = redact_units(
                     splitters.split(path or Path(meta["file"]), name,
-                                    settings or _settings_from(meta)).units, cfg)
+                                    settings or _settings_from(meta, name)).units, cfg)
                 feed_store.replace_units(conn, name, units, state)
         return _insert_chunks(conn, doc_id, name, units)
     except (ValueError, OSError, KeyError) as exc:

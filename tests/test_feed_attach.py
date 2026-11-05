@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -19,6 +20,7 @@ from akasha.db import connect
 from akasha.events import recent
 from akasha.index import index_all
 from akasha.markdown import parse_frontmatter
+from akasha.search import search
 from akasha.splitters import FeedSettings, Unit
 
 ROWS = "item,price\nbolt,4\nnut,2\n"
@@ -56,7 +58,8 @@ def env(tmp_path):
 def make_dataset(env):
     _, cfg = env
 
-    def build(name="prices", rows=ROWS, settings=None, sha=None, repo="sample-repo"):
+    def build(name="prices", rows=ROWS, settings=None, sha=None, repo="sample-repo",
+              raw_settings=None):
         settings = settings or FeedSettings()
         copy = cfg.knowledge_dir.parent / "files" / repo / f"{name}.csv"
         copy.parent.mkdir(parents=True, exist_ok=True)
@@ -67,7 +70,9 @@ def make_dataset(env):
             DATASET_DOC.format(
                 name=name, repo=repo, file=copy,
                 sha=sha or hashlib.sha256(copy.read_bytes()).hexdigest(),
-                settings_sha=settings.sha256(), settings_json=settings.to_json()),
+                settings_sha=settings.sha256(),
+                settings_json=(json.dumps(raw_settings) if raw_settings is not None
+                               else settings.to_json())),
             encoding="utf-8")
         return doc, copy
 
@@ -118,7 +123,8 @@ def test_indexing_a_dataset_doc_splits_the_copy_and_adds_one_chunk_per_cell(
     ]
     assert [u.locator for u in feed_store.load_units(conn, "prices")] == ["row:2", "row:3"]
     sha = hashlib.sha256(copy.read_bytes()).hexdigest()
-    assert feed_store.stored_state(conn, "prices") == f"{sha}:{FeedSettings().sha256()}"
+    assert feed_store.stored_state(conn, "prices") == feed.unit_state(
+        sha, FeedSettings().sha256(), cfg)
 
 
 def test_reindex_with_current_state_does_not_resplit(env, make_dataset, monkeypatch):
@@ -249,3 +255,139 @@ def test_non_dataset_docs_unaffected(env):
     assert stats.indexed == 1
     assert stats.dataset_errors == []
     assert conn.execute("SELECT COUNT(*) c FROM feed_chunks").fetchone()["c"] == 0
+
+
+def test_bad_settings_are_reported_and_index_continues(env, make_dataset):
+    """Frontmatter is data: an unknown key or a wrong type must be a reported dataset
+    error, not a TypeError that ends the whole index run."""
+    conn, cfg = env
+    make_dataset(raw_settings={"colour": "red"})
+    notes = cfg.knowledge_dir / "sample-repo" / "notes.md"
+    notes.parent.mkdir(parents=True, exist_ok=True)
+    notes.write_text("## Shelving\nLoanService new\n", encoding="utf-8")
+
+    stats = index_all(conn, cfg)
+
+    assert stats.indexed == 2
+    assert [name for name, _message in stats.dataset_errors] == ["prices"]
+    assert "invalid settings" in stats.dataset_errors[0][1]
+    assert "colour" in stats.dataset_errors[0][1]
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM chunks c JOIN documents d ON d.id = c.document_id"
+        " WHERE d.path = ?", (str(notes),)).fetchone()["c"] == 1
+
+
+def test_secret_in_key_or_label_is_redacted(env, make_dataset):
+    """The key and the label are built from cells (excluded columns included) and are
+    stored and shown in chunk bodies, so scrubbing only `fields` leaks through them."""
+    conn, cfg = env
+    make_dataset(rows="id,note\nAKIAABCDEFGHIJKLMNOP,bearer fedcba0987654321fedcba\n",
+                 settings=FeedSettings(key="id", label="{note}"))
+    index_all(conn, cfg)
+
+    stored = feed_store.load_units(conn, "prices")[0]
+    assert stored.key == "[REDACTED:aws_access_key]"
+    assert stored.label == "[REDACTED:bearer]"
+    assert stored.fields == {"id": "[REDACTED:aws_access_key]",
+                             "note": "[REDACTED:bearer]"}
+    body = _unit_chunks(conn, _doc_id(conn))[0]["body"]
+    assert body == "[REDACTED:bearer] · id: [REDACTED:aws_access_key]"
+
+
+def test_enabling_scan_secrets_resplits_and_redacts(env, make_dataset):
+    """Units stored while scanning was off hold raw secrets; turning scanning on must
+    not reuse them, or the raw text stays searchable and in the store forever."""
+    conn, cfg = env
+    cfg.scan_secrets = False
+    make_dataset(rows="note\nAuthorization: Bearer abcdef1234567890abcdef\n")
+    index_all(conn, cfg)
+    assert feed_store.load_units(conn, "prices")[0].fields["note"].startswith("Authorization")
+
+    cfg.scan_secrets = True
+    index_all(conn, cfg)
+
+    assert feed_store.load_units(conn, "prices")[0].fields["note"] == "[REDACTED:bearer]"
+    assert _unit_chunks(conn, _doc_id(conn))[0]["body"] == \
+        "prices row:2 · note: [REDACTED:bearer]"
+
+
+def test_moved_dataset_doc_leaves_one_fts_hit_for_its_text(env, make_dataset):
+    """A moved doc gives the same cell a new document row under the same chunk id, and a
+    REPLACE conflict skips the delete trigger, so the old text would stay in the FTS
+    index and the cell would be found twice."""
+    conn, cfg = env
+    doc, _copy = make_dataset()
+    index_all(conn, cfg)
+    doc.rename(doc.with_name("prices-moved.md"))
+
+    index_all(conn, cfg)
+
+    hits = search(conn, "bolt", all_repos=True, limit=10)
+    assert [hit.text for hit in hits] == ["prices row:2 · item: bolt"]
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM chunks_fts WHERE chunks_fts MATCH '\"bolt\"'"
+    ).fetchone()["c"] == 1
+
+
+def test_label_change_changes_chunk_ids(env, make_dataset):
+    """The chunk id carries a stored vector, so it has to change when the embedded text
+    does: a relabelled row is a different text, not the same chunk with a new body."""
+    conn, cfg = env
+    doc, _copy = make_dataset()
+    index_all(conn, cfg)
+    before = {chunk["id"] for chunk in _unit_chunks(conn, _doc_id(conn))}
+
+    doc, _copy = make_dataset(settings=FeedSettings(label="{item}"))
+    os.utime(doc, (time.time() + 10, time.time() + 10))
+    index_all(conn, cfg)
+
+    after = _unit_chunks(conn, _doc_id(conn))
+    assert before.isdisjoint({chunk["id"] for chunk in after})
+    assert after[0]["body"] == "bolt · item: bolt"
+
+
+def test_changed_readable_copy_resplits_and_replaces_units_and_state(env, make_dataset):
+    """An edited copy is the normal case for a dataset: the stored units and the state
+    must both be replaced, or the change report and the chunks disagree with the file."""
+    conn, cfg = env
+    doc, _copy = make_dataset()
+    index_all(conn, cfg)
+    first_state = feed_store.stored_state(conn, "prices")
+
+    doc, copy = make_dataset(rows="item,price\nbolt,5\nnut,2\n")
+    os.utime(doc, (time.time() + 10, time.time() + 10))
+    index_all(conn, cfg)
+
+    units = feed_store.load_units(conn, "prices")
+    assert [unit.fields for unit in units] == [{"item": "bolt", "price": "5"},
+                                               {"item": "nut", "price": "2"}]
+    sha = hashlib.sha256(copy.read_bytes()).hexdigest()
+    state = feed.unit_state(sha, FeedSettings().sha256(), cfg)
+    assert feed_store.stored_state(conn, "prices") == state != first_state
+    chunks = _unit_chunks(conn, _doc_id(conn))
+    assert [chunk["body"] for chunk in chunks] == ["prices row:2 · item: bolt",
+                                                   "prices row:2 · price: 5",
+                                                   "prices row:3 · item: nut",
+                                                   "prices row:3 · price: 2"]
+
+
+def test_redact_units_is_noop_without_scan_and_counts_changed_cells(env):
+    """The count is what tells `feed add` how much it scrubbed, and with scanning off the
+    units must come back untouched rather than with an empty-looking count."""
+    _, cfg = env
+    units = [
+        Unit(locator="row:2", key="AKIAABCDEFGHIJKLMNOP",
+             label="prices AKIAABCDEFGHIJKLMNOP", fields={"note": "fine"}),
+        Unit(locator="row:3", key=None, label="prices row:3",
+             fields={"note": "Authorization: Bearer abcdef1234567890abcdef"}),
+    ]
+
+    off = replace(cfg, scan_secrets=False)
+    same, count = feed.redact_units(units, off)
+    assert (same, count) == (units, 0)
+
+    cleaned, count = feed.redact_units(units, cfg)
+    assert count == 3
+    assert cleaned[0].key == "[REDACTED:aws_access_key]"
+    assert cleaned[0].label == "prices [REDACTED:aws_access_key]"
+    assert cleaned[1].fields["note"] == "[REDACTED:bearer]"
