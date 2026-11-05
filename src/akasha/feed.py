@@ -58,6 +58,11 @@ def redact_units(units: list[Unit], cfg: Config) -> tuple[list[Unit], int]:
         fields = {name: _scrub(value) for name, value in unit.fields.items()}
         changed += ((key != unit.key) + (label != unit.label)
                     + sum(fields[name] != value for name, value in unit.fields.items()))
+        if key != unit.key:
+            # Distinct secret-shaped keys all redact to one placeholder, and a stored key
+            # is what pairs a row across imports; a shared placeholder would pair
+            # unrelated rows. Dropping it falls back to the locator.
+            key = None
         cleaned.append(unit._replace(key=key, label=label, fields=fields))
     return cleaned, changed
 

@@ -286,7 +286,8 @@ def test_secret_in_key_or_label_is_redacted(env, make_dataset):
     index_all(conn, cfg)
 
     stored = feed_store.load_units(conn, "prices")[0]
-    assert stored.key == "[REDACTED:aws_access_key]"
+    # Dropped rather than kept as the placeholder: a key is what pairs rows across imports.
+    assert stored.key is None
     assert stored.label == "[REDACTED:bearer]"
     assert stored.fields == {"id": "[REDACTED:aws_access_key]",
                              "note": "[REDACTED:bearer]"}
@@ -388,6 +389,28 @@ def test_redact_units_is_noop_without_scan_and_counts_changed_cells(env):
 
     cleaned, count = feed.redact_units(units, cfg)
     assert count == 3
-    assert cleaned[0].key == "[REDACTED:aws_access_key]"
+    # A redacted key is dropped: the placeholder would otherwise be a key two unrelated
+    # rows share.
+    assert cleaned[0].key is None
     assert cleaned[0].label == "prices [REDACTED:aws_access_key]"
     assert cleaned[1].fields["note"] == "[REDACTED:bearer]"
+
+
+def test_redacted_keys_fall_back_to_locator(env):
+    """Two different secret-shaped keys redact to the same placeholder, and a duplicate
+    key pairs unrelated rows, so a redacted key must leave the row addressed by locator."""
+    _, cfg = env
+    units = [
+        Unit(locator="row:2", key="AKIAABCDEFGHIJKLMNOP",
+             label="prices AKIAABCDEFGHIJKLMNOP", fields={"note": "first"}),
+        Unit(locator="row:3", key="AKIAQRSTUVWXYZ234567",
+             label="prices AKIAQRSTUVWXYZ234567", fields={"note": "second"}),
+    ]
+
+    cleaned, count = feed.redact_units(units, cfg)
+
+    assert [unit.key for unit in cleaned] == [None, None]
+    assert count == 4
+    # The same rows, reordered: pairing by locator keeps each row with itself, where the
+    # shared placeholder would have paired row:2 with whatever came first.
+    assert feed_store.diff(cleaned, list(reversed(cleaned))).empty()
