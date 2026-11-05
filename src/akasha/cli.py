@@ -123,6 +123,8 @@ def cmd_index(args) -> int:
         print(f"kind fallback {stats.kind_fallback}: unknown kind, stored as reference")
     for _path, message in stats.collisions:
         print(f"not indexed: {message}")
+    for name, message in stats.dataset_errors:
+        print(f"dataset error: {name}: {message}")
     if stats.vectors:
         print(f"vectors {stats.vectors:,}")
     if stats.redacted:

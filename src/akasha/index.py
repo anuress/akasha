@@ -196,6 +196,12 @@ def index_path(
             "INSERT INTO chunks (id, document_id, title, heading, body, ord) VALUES (?,?,?,?,?,?)",
             (new_id("c"), doc_id, title, c.heading, c.body, c.ord),
         )
+    if kind == "dataset" and meta.get("dataset"):
+        # Lazy: the feed write path reaches back into the indexer, so a module-level import
+        # would make the import graph two-way.
+        from akasha.feed import attach
+
+        attach(conn, cfg, doc_id, meta)
     sync_links(conn, doc_id, body)
     if inj:
         emit(conn, "security.injection", document=doc_id, path=str(path), rules=inj,
@@ -248,7 +254,11 @@ def _scan_config_marker(cfg: Config) -> str:
 def index_all(conn: sqlite3.Connection, cfg: Config, force: bool = False) -> IndexStats:
     """Walk every configured root plus the owned knowledge dir. `force` reprocesses
     files whose stat is unchanged."""
+    from akasha import feed
+
     stats = IndexStats()
+    # Errors of the last run only: a dataset fixed since then must not keep reporting.
+    feed.ATTACH_ERRORS.clear()
     marker = _scan_config_marker(cfg)
     stored = conn.execute("SELECT value FROM meta WHERE key=?", (SCAN_CONFIG_KEY,)).fetchone()
     force = force or stored is None or stored["value"] != marker
@@ -299,6 +309,7 @@ def index_all(conn: sqlite3.Connection, cfg: Config, force: bool = False) -> Ind
         # Inside the loop: a root that does not exist was skipped above, so an unmounted
         # disk or a renamed directory is never read as "every document was deleted".
         stats.pruned += _prune(conn, root, seen)
+    stats.dataset_errors = list(feed.ATTACH_ERRORS)
     # Recorded only once the walk finished, so an interrupted forced pass is forced again.
     conn.execute(
         "INSERT INTO meta (key, value) VALUES (?, ?)"
