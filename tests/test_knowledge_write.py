@@ -222,3 +222,25 @@ def test_write_refuses_a_repo_folder_that_resolves_outside_the_knowledge_dir(env
     with pytest.raises(ValueError, match="repo"):
         write(conn, cfg, "T", "## H\nb", repo="linked")
     assert list(outside.iterdir()) == []
+
+
+def test_reindex_joins_a_callers_transaction_when_commit_is_false(env):
+    """commit=False: the caller's rollback undoes the reindex, leaving the pre-edit rows."""
+    from pathlib import Path
+
+    from akasha.knowledge import _reindex
+
+    conn, cfg = env
+    doc_id = write(conn, cfg, "T", "## A\nbefore\n", repo="r")
+    path = Path(conn.execute(
+        "SELECT path FROM documents WHERE id = ?", (doc_id,)).fetchone()["path"])
+    query = "SELECT id, body FROM chunks WHERE document_id = ? ORDER BY ord"
+    before = [dict(r) for r in conn.execute(query, (doc_id,))]
+    path.write_text(path.read_text().replace("before", "after-edit"))
+
+    conn.execute("BEGIN IMMEDIATE")
+    _reindex(conn, cfg, path, commit=False)
+    assert conn.in_transaction, "_reindex must not commit the caller's transaction"
+    conn.execute("ROLLBACK")
+
+    assert [dict(r) for r in conn.execute(query, (doc_id,))] == before

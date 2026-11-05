@@ -51,3 +51,13 @@ def test_payload_fields_are_trimmed_exactly_at_the_boundary(conn):
     assert payload["one_over"] == "b" * MAX_FIELD + "…"
     assert payload["number"] == 7 and payload["flag"] is True, \
         "only strings are bounded"
+
+
+def test_emit_joins_a_callers_transaction_when_commit_is_false(conn):
+    """commit=False leaves the commit to the caller: one transaction can span emit, and a
+    rollback takes the event with it."""
+    conn.execute("BEGIN IMMEDIATE")
+    emit(conn, "knowledge.written", document="doc-1", commit=False)
+    assert conn.in_transaction, "emit must not commit the caller's transaction"
+    conn.execute("ROLLBACK")
+    assert recent(conn) == []

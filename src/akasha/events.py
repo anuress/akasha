@@ -17,14 +17,17 @@ def _trim(value):
     return value
 
 
-def emit(conn: sqlite3.Connection, kind: str, **payload) -> str:
+def emit(conn: sqlite3.Connection, kind: str, commit: bool = True, **payload) -> str:
     event_id = new_id("e")
     trimmed = {k: _trim(v) for k, v in payload.items()}
     conn.execute(
         "INSERT INTO events (id, ts, kind, payload) VALUES (?,?,?,?)",
         (event_id, now(), kind, json.dumps(trimmed, default=str)),
     )
-    conn.commit()
+    # commit=False leaves the row in the caller's transaction: one operation that must
+    # land or vanish as a whole records its events without ending the transaction.
+    if commit:
+        conn.commit()
     return event_id
 
 

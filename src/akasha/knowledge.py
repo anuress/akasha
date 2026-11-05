@@ -164,7 +164,7 @@ def _check_no_drift(row: sqlite3.Row, path: Path) -> None:
         f"{backup}. Re-read the file now and re-apply your change on top of it; that "
         "is the only correct recovery.")
 
-def _reindex(conn: sqlite3.Connection, cfg: Config, path: Path) -> None:
+def _reindex(conn: sqlite3.Connection, cfg: Config, path: Path, commit: bool = True) -> None:
     # Lazy: index.py imports canonical_kind from here, so a module-level import of
     # index_path would be a cycle.
     from akasha.index import index_path
@@ -181,8 +181,10 @@ def _reindex(conn: sqlite3.Connection, cfg: Config, path: Path) -> None:
     conn.execute("UPDATE documents SET mtime = NULL WHERE path = ?", (str(path),))
     index_path(conn, cfg, path, source,
                root=Path(root.path).expanduser() if root else None,
-               root_repo=root.repo if root else None)
-    conn.commit()
+               root_repo=root.repo if root else None,
+               commit_events=commit)
+    if commit:
+        conn.commit()
 
 def write(
     conn: sqlite3.Connection,

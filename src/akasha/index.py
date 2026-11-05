@@ -80,14 +80,15 @@ def _matches(path: Path, root: Path, patterns: list[str]) -> bool:
 
 def index_path(
     conn: sqlite3.Connection, cfg: Config, path: Path, source: str, root: Path | None = None,
-    root_repo: str | None = None, force: bool = False,
+    root_repo: str | None = None, force: bool = False, commit_events: bool = True,
 ) -> tuple[str, list[str], int] | None:
     """Index one markdown file. Returns (document id, redaction hits, kind fallback
     count), or None when refused or unchanged.
 
     The unchanged check comes first and needs only a stat, so a no-op run never reads,
     redacts or scans a file. `force` skips it, for when the scan rules changed and an
-    unchanged file must still be processed again.
+    unchanged file must still be processed again. `commit_events=False` keeps this
+    function inside the caller's transaction, the injection event included.
     """
     if is_denied(path, cfg) or path.suffix.lower() != ".md":
         return None
@@ -197,7 +198,8 @@ def index_path(
         )
     sync_links(conn, doc_id, body)
     if inj:
-        emit(conn, "security.injection", document=doc_id, path=str(path), rules=inj)
+        emit(conn, "security.injection", document=doc_id, path=str(path), rules=inj,
+             commit=commit_events)
     return doc_id, hits, kind_fallback
 
 
