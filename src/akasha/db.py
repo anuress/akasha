@@ -79,6 +79,12 @@ CREATE TABLE IF NOT EXISTS events (
   id TEXT PRIMARY KEY, ts TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+
+-- Additive rather than a SCHEMA_VERSION bump: a bump makes every existing akasha.db
+-- unusable, and the runs and events in it cannot be rebuilt from markdown.
+CREATE TABLE IF NOT EXISTS feed_units (dataset TEXT NOT NULL, locator TEXT NOT NULL, key TEXT, label TEXT NOT NULL, fields TEXT NOT NULL, ord INTEGER NOT NULL, PRIMARY KEY (dataset, locator));
+CREATE TABLE IF NOT EXISTS feed_chunks (chunk_id TEXT PRIMARY KEY, dataset TEXT NOT NULL, locator TEXT NOT NULL, field TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_feed_chunks_dataset ON feed_chunks(dataset);
 """
 
 

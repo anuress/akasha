@@ -1,5 +1,5 @@
-"""The schema is knowledge storage only: documents, chunks, links, features, events and
-meta. Nothing else is created, and nothing a kept feature does not read is stored."""
+"""The schema holds the knowledge tables and the feed tables, nothing else. Nothing a
+kept feature or the feed importer does not read is stored."""
 import pytest
 
 from akasha.db import connect
@@ -14,9 +14,13 @@ def _columns(conn, table):
     return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
 
 
-def test_the_only_tables_are_the_knowledge_ones(tmp_path):
+def test_the_only_tables_are_the_knowledge_and_feed_ones(tmp_path):
+    """An unexpected table means dead storage nothing reads, and a missing feed table
+    means the importer would have to create it outside the schema."""
     conn = connect(tmp_path / "s.db")
-    assert _tables(conn) == {"features", "documents", "chunks", "links", "events", "meta"}
+    assert _tables(conn) == {
+        "features", "documents", "chunks", "links", "events", "meta",
+        "feed_units", "feed_chunks"}
 
 
 def test_documents_carry_only_the_columns_a_kept_feature_reads(tmp_path):
