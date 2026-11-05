@@ -1,11 +1,14 @@
 import json
 import os
+import sys
 
 import pytest
 
-from akasha import doctor, install, vectors
+from akasha import doctor, feed, install, vectors
 from akasha.config import IndexRoot, load_config
 from akasha.db import connect
+from akasha.events import emit
+from akasha.splitters import FeedSettings
 
 
 @pytest.fixture
@@ -440,3 +443,75 @@ def test_unparsable_hook_settings_are_an_error(env, monkeypatch):
     path.write_text("{not json")
     findings = _run(env)
     assert any(f.kind == "hook" and f.severity == "error" for f in findings)
+
+
+# --- datasets ------------------------------------------------------------------------
+
+def _feed_csv(env, tmp_path, name="prices"):
+    """One fed dataset from a synthetic export."""
+    conn, cfg, _home = env
+    source = tmp_path / f"{name}.csv"
+    source.write_text("item,price\nbolt,4\nnut,2\n", encoding="utf-8")
+    return feed.feed(conn, cfg, source, name, settings=FeedSettings(key="item"),
+                     repo="sample-repo")
+
+
+def test_an_xlsx_dataset_without_the_extra_is_an_error(env, tmp_path, monkeypatch):
+    """A dataset the install cannot re-split is a degraded install with no other symptom."""
+    conn, cfg, _home = env
+    openpyxl = pytest.importorskip("openpyxl")
+    workbook = openpyxl.Workbook()
+    for row in (("item", "price"), ("bolt", 4)):
+        workbook.active.append(list(row))
+    source = tmp_path / "prices.xlsx"
+    workbook.save(source)
+    feed.feed(conn, cfg, source, "prices", settings=FeedSettings(key="item"),
+              repo="sample-repo")
+    monkeypatch.setitem(sys.modules, "openpyxl", None)
+
+    findings = [f for f in _run(env) if f.kind == "xlsx"]
+
+    assert len(findings) == 1
+    assert findings[0].severity == "error"
+    assert "akasha-mcp[xlsx]" in findings[0].detail
+    assert doctor.exit_code(_run(env)) == 1
+
+
+def test_a_missing_xlsx_extra_with_no_xlsx_dataset_says_nothing(env, tmp_path, monkeypatch):
+    """An extra nobody's data needs must not keep doctor red."""
+    _feed_csv(env, tmp_path)
+    monkeypatch.setitem(sys.modules, "openpyxl", None)
+
+    assert "xlsx" not in _kinds(_run(env))
+
+
+def test_an_attach_failure_is_reported_until_the_units_are_rebuilt(env, tmp_path):
+    """Search answers with older cells, and a rolled-back feed leaves only the event."""
+    conn, _cfg, _home = env
+    _feed_csv(env, tmp_path)
+    emit(conn, "feed.attach_failed", dataset="prices",
+         error="prices.csv is not UTF-8; re-export as UTF-8 CSV")
+    conn.execute("DELETE FROM meta WHERE key = 'feed_state:prices'")
+
+    findings = [f for f in _run(env) if f.kind == "dataset_attach"]
+
+    assert len(findings) == 1
+    assert findings[0].severity == "warning"
+    assert "not UTF-8" in findings[0].detail
+
+
+def test_a_healed_attach_failure_is_history(env, tmp_path):
+    """Once the document's own units are stored again the failure is not actionable."""
+    conn, _cfg, _home = env
+    _feed_csv(env, tmp_path)
+    emit(conn, "feed.attach_failed", dataset="prices", error="an older failure")
+
+    assert not [f for f in _run(env) if f.kind == "dataset_attach"]
+
+
+def test_an_attach_failure_for_a_removed_dataset_is_history(env):
+    """A dataset whose document is gone has nothing an agent can repair."""
+    conn, _cfg, _home = env
+    emit(conn, "feed.attach_failed", dataset="removed", error="gone")
+
+    assert not [f for f in _run(env) if f.kind == "dataset_attach"]

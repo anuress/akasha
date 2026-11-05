@@ -1,11 +1,15 @@
+import hashlib
 from pathlib import Path
 
 import pytest
 
+from akasha import feed
 from akasha.config import IndexRoot, load_config
 from akasha.db import connect
 from akasha.fsck import MAX_READ_CHARS, check
 from akasha.index import index_path
+from akasha.markdown import parse_frontmatter
+from akasha.splitters import FeedSettings
 from akasha.knowledge import write
 
 
@@ -589,3 +593,122 @@ def test_a_clean_run_records_zero(env):
     write(conn, cfg, "Only doc", "## A\ncontent here\n", repo="r")
     report(conn, cfg)
     assert cached_error_count(conn) == 0
+
+
+# --- datasets ------------------------------------------------------------------------
+
+def _dataset(env, tmp_path, name="prices"):
+    """One fed dataset: the state every dataset finding is about."""
+    conn, cfg = env
+    source = tmp_path / f"{name}.csv"
+    source.write_text("item,price\nbolt,4\nnut,2\n", encoding="utf-8")
+    return feed.feed(conn, cfg, source, name, settings=FeedSettings(key="item"),
+                     repo="sample-repo")
+
+
+def _dataset_doc(cfg, name="prices"):
+    return cfg.knowledge_dir / "sample-repo" / "datasets" / f"{name}.md"
+
+
+def _dataset_findings(conn, cfg):
+    return [f for f in check(conn, cfg) if f.kind.startswith("dataset_")]
+
+
+def test_clean_dataset_has_no_dataset_findings(env, tmp_path):
+    """A healthy dataset must add no noise, or the whole report gets skipped as noise."""
+    conn, cfg = env
+    _dataset(env, tmp_path)
+
+    assert _dataset_findings(conn, cfg) == []
+
+
+def test_a_dataset_whose_copy_vanished_is_an_error(env, tmp_path):
+    """The document promises cells it can no longer re-read, and only a re-feed restores it."""
+    conn, cfg = env
+    result = _dataset(env, tmp_path)
+    result.copy.unlink()
+
+    findings = [f for f in _dataset_findings(conn, cfg) if f.kind == "dataset_copy_missing"]
+
+    assert len(findings) == 1
+    assert findings[0].severity == "error"
+    assert findings[0].document_id == result.doc_id
+    assert "akasha feed add" in findings[0].detail
+
+
+def test_a_copy_whose_bytes_changed_is_an_error_naming_both_shas(env, tmp_path):
+    """A rebuild trusts the frontmatter sha, so a silent edit leaves the units unexplained."""
+    conn, cfg = env
+    result = _dataset(env, tmp_path)
+    result.copy.write_text("item,price\nbolt,9\n", encoding="utf-8")
+    actual = hashlib.sha256(result.copy.read_bytes()).hexdigest()
+    recorded = parse_frontmatter(_dataset_doc(cfg).read_text())[0]["sha256"]
+
+    findings = [f for f in _dataset_findings(conn, cfg) if f.kind == "dataset_copy_mismatch"]
+
+    assert len(findings) == 1
+    assert findings[0].severity == "error"
+    assert findings[0].document_id == result.doc_id
+    assert actual[:12] in findings[0].detail
+    assert recorded[:12] in findings[0].detail
+    assert "feed the original file again" in findings[0].detail
+
+
+def test_units_that_are_not_the_copy_are_stale_and_say_to_force_a_reindex(env, tmp_path):
+    """Stale units answer searches with cells the document no longer describes."""
+    conn, cfg = env
+    result = _dataset(env, tmp_path)
+    conn.execute("UPDATE meta SET value = 'older' WHERE key = 'feed_state:prices'")
+
+    findings = [f for f in _dataset_findings(conn, cfg) if f.kind == "dataset_units_stale"]
+
+    assert len(findings) == 1
+    assert findings[0].severity == "warning"
+    assert findings[0].document_id == result.doc_id
+    assert "akasha index --force" in findings[0].detail
+
+
+def test_a_file_no_dataset_names_is_an_orphan(env, tmp_path):
+    """An orphan costs disk and reads as a dataset copy to anyone looking at the files dir."""
+    conn, cfg = env
+    _dataset(env, tmp_path)
+    stray = cfg.knowledge_dir.parent / "files" / "sample-repo" / "notes.csv"
+    stray.write_text("a\n1\n", encoding="utf-8")
+
+    findings = [f for f in _dataset_findings(conn, cfg) if f.kind == "dataset_copy_orphan"]
+
+    assert len(findings) == 1
+    assert findings[0].severity == "warning"
+    assert findings[0].document_id is None
+    assert str(stray) in findings[0].detail
+
+
+def test_staging_and_backup_files_are_leftovers_not_orphans(env, tmp_path):
+    """Both are what an interrupted feed leaves, and neither is a copy worth keeping."""
+    conn, cfg = env
+    _dataset(env, tmp_path)
+    repo_dir = cfg.knowledge_dir.parent / "files" / "sample-repo"
+    staging = repo_dir / "prices.staging.csv"
+    backup = Path(f"{repo_dir / 'prices.csv'}.bak")
+    staging.write_text("item,price\n", encoding="utf-8")
+    backup.write_text("item,price\n", encoding="utf-8")
+
+    findings = _dataset_findings(conn, cfg)
+
+    leftovers = [f for f in findings if f.kind == "dataset_leftover_temp"]
+    assert len(leftovers) == 2
+    assert all(f.severity == "warning" and f.document_id is None for f in leftovers)
+    assert any(str(staging) in f.detail for f in leftovers)
+    assert any(str(backup) in f.detail for f in leftovers)
+    assert not [f for f in findings if f.kind == "dataset_copy_orphan"]
+
+
+def test_trash_and_locks_are_not_orphans(env, tmp_path):
+    """akasha moves a replaced copy to the trash and keeps its locks; both are deliberate."""
+    conn, cfg = env
+    _dataset(env, tmp_path)
+    files = cfg.knowledge_dir.parent / "files"
+    (files / ".trash" / "sample-repo").mkdir(parents=True)
+    (files / ".trash" / "sample-repo" / "old.csv").write_text("item\n", encoding="utf-8")
+
+    assert _dataset_findings(conn, cfg) == []

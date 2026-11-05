@@ -11,6 +11,7 @@ There is deliberately no printer here; rendering is the caller's job.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import stat
 import tomllib
@@ -18,10 +19,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from akasha import vectors
+from akasha import feed, feed_store, vectors
 from akasha.config import Config
 from akasha.db import SCHEMA_VERSION
-from akasha.fsck import cached_error_count
+from akasha.fsck import cached_error_count, dataset_documents
 from akasha.hooks import conventions_over_budget
 from akasha.install import (INSTALLED_HOOK_COMMAND, VENDORS, ConfigError, detect_vendors,
                             hook_vendors, mcp_problem, mcp_registered,
@@ -217,6 +218,52 @@ def _failures(conn: sqlite3.Connection) -> list[Finding]:
                     f"{failed} tool failure(s) in 7 days; `akasha knowledge stats`")]
 
 
+def _dataset_attach(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:
+    """The last attach failure of each dataset whose units are still not its own.
+
+    A successful attach stores the state the document asks for, so an event is history once
+    `stored_state` matches `unit_state`; until then doctor is the only place that says why
+    search answers with older cells. A failure whose document is gone is history too.
+    """
+    latest: dict[str, str] = {}
+    for row in conn.execute(
+        "SELECT payload FROM events WHERE kind = 'feed.attach_failed'"
+        " ORDER BY ts DESC, rowid DESC"
+    ):
+        try:
+            payload = json.loads(row["payload"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        name = payload.get("dataset")
+        if name and name not in latest:
+            latest[name] = str(payload.get("error") or "")
+    findings: list[Finding] = []
+    for _doc_id, meta in dataset_documents(conn):
+        name = str(meta["dataset"])
+        if name not in latest:
+            continue
+        state = feed.unit_state(str(meta.get("sha256") or ""),
+                                str(meta.get("settings_sha256") or ""), cfg)
+        if feed_store.stored_state(conn, name) != state:
+            findings.append(Finding("dataset_attach", "warning",
+                                    f"dataset '{name}': {latest[name]}"))
+    return findings
+
+
+def _xlsx(conn: sqlite3.Connection) -> list[Finding]:
+    """Name the extra only while a dataset needs it; otherwise its absence is not news."""
+    if not any(str(meta.get("file") or "").lower().endswith(".xlsx")
+               for _doc_id, meta in dataset_documents(conn)):
+        return []
+    try:
+        import openpyxl  # noqa: F401
+    except ImportError:
+        return [Finding("xlsx", "error",
+                        "an xlsx dataset cannot be split again, extra not installed; "
+                        "uv tool install 'akasha-mcp[xlsx]'")]
+    return []
+
+
 def _isolated(kind: str, run) -> list[Finding]:
     """Run one check. A check that cannot run is a finding, not the end of the report: an
     aborted report would hide every check after it."""
@@ -236,6 +283,8 @@ def check(cfg: Config, conn: sqlite3.Connection, home: Path | None = None,
         ("config", lambda: _config(config_path)),
         ("index_root", lambda: _sources(cfg, conn)),
         ("knowledge", lambda: _knowledge(conn)),
+        ("xlsx", lambda: _xlsx(conn)),
+        ("dataset_attach", lambda: _dataset_attach(conn, cfg)),
         ("custom_kinds", lambda: _custom_kinds(cfg)),
         ("conventions", lambda: _conventions(conn)),
         ("vectors", lambda: [_vectors(cfg, conn)]),

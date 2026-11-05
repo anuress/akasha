@@ -7,12 +7,14 @@ pure query with no inference in it.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from akasha import feed, feed_store
 from akasha.config import Config
 from akasha.links import FENCE_BLOCK
 from akasha.markdown import parse_frontmatter
@@ -167,8 +169,89 @@ def _near_duplicates(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:
                 f"with knowledge_append; never just drop one"))
     return findings
 
-def check(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:
+
+def dataset_documents(conn: sqlite3.Connection) -> list[tuple[str, dict]]:
+    """Each active dataset document's id and its file's frontmatter.
+
+    Shared with `doctor`, so both report on the same documents. A document whose file is
+    gone is skipped: `missing_file` already owns absent paths.
+    """
+    found: list[tuple[str, dict]] = []
+    for row in conn.execute(
+        "SELECT id, path FROM documents WHERE deleted_at IS NULL"
+        " AND status != 'archived' AND kind = 'dataset'"
+    ):
+        file = Path(row["path"])
+        if not file.is_file():
+            continue
+        meta, _body = parse_frontmatter(file.read_text(errors="replace"))
+        if meta.get("dataset"):
+            found.append((row["id"], meta))
+    return found
+
+
+def _leftovers(cfg: Config, named: set[Path]) -> list[Finding]:
+    """Files no dataset names, and what an interrupted feed left in the files dir.
+
+    One level under `files/<repo>/`. `.trash` holds what a replaced copy became and `.locks`
+    the feed locks, so both are deliberate. A staging or backup file is reported as a
+    leftover rather than an orphan: it needs deleting, not identifying.
+    """
+    files_dir = cfg.knowledge_dir.parent / "files"
+    if not files_dir.is_dir():
+        return []
     findings: list[Finding] = []
+    for repo_dir in sorted(path for path in files_dir.iterdir() if path.is_dir()):
+        if repo_dir.name in feed.RESERVED_REPOS:
+            continue
+        for entry in sorted(path for path in repo_dir.iterdir() if path.is_file()):
+            if ".staging." in entry.name or entry.name.endswith(".bak"):
+                findings.append(Finding(
+                    "dataset_leftover_temp", "warning", None,
+                    f"{entry} is left from an interrupted feed; safe to delete once no "
+                    "feed is running"))
+            elif entry.resolve() not in named:
+                findings.append(Finding(
+                    "dataset_copy_orphan", "warning", None,
+                    f"{entry} is no dataset's copy; delete it or feed it again"))
+    return findings
+
+
+def _datasets(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:
+    """Dataset documents whose copy, or whose units, no longer match the promise.
+
+    The frontmatter is the promise: `sha256` and `settings_sha256` are what a rebuild reads
+    the cells from, so a copy that is gone or edited leaves cells nothing explains.
+    """
+    findings: list[Finding] = []
+    named: set[Path] = set()
+    for doc_id, meta in dataset_documents(conn):
+        name = str(meta["dataset"])
+        copy = Path(str(meta.get("file") or ""))
+        recorded = str(meta.get("sha256") or "")
+        named.add(copy.resolve())
+        if not copy.is_file():
+            findings.append(Finding(
+                "dataset_copy_missing", "error", doc_id,
+                "copy missing; feed the original file again with `akasha feed add`"))
+            continue
+        actual = hashlib.sha256(copy.read_bytes()).hexdigest()
+        if actual != recorded:
+            findings.append(Finding(
+                "dataset_copy_mismatch", "error", doc_id,
+                f"copy is {actual[:12]}, the document says {recorded[:12]}; "
+                "feed the original file again"))
+        expected = feed.unit_state(recorded, str(meta.get("settings_sha256") or ""), cfg)
+        if feed_store.stored_state(conn, name) != expected:
+            findings.append(Finding(
+                "dataset_units_stale", "warning", doc_id,
+                f"the units of '{name}' are not the ones this copy gives; "
+                "run `akasha index --force`"))
+    return findings + _leftovers(cfg, named)
+
+
+def check(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:
+    findings: list[Finding] = _datasets(conn, cfg)
 
     for row in duplicate_groups(conn):
         scope = f"{row['repo'] or '-'}"
