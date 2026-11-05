@@ -7,6 +7,7 @@ import json
 import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Callable, Iterator, NamedTuple
 
@@ -100,7 +101,45 @@ def clean_headers(raw: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
     return headers, renamed
 
 
+def _cell_text(value: object) -> str:
+    """Spreadsheet cell to searchable text; a caller must never read a Python repr."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, datetime):
+        return value.date().isoformat() if value.time() == time(0) else value.isoformat()
+    if isinstance(value, (date, time)):
+        return value.isoformat()
+    # Excel hands a whole number back as a float, and "42.0" would read as a different value.
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _xlsx_rows(path: Path, settings: FeedSettings) -> Iterator[list[str]]:
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise ValueError("xlsx needs the extra: uv tool install 'akasha-mcp[xlsx]'") from None
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        titles = workbook.sheetnames
+        if settings.sheet is not None and settings.sheet not in titles:
+            raise ValueError(f"{path.name}: no sheet '{settings.sheet}'; sheets: {', '.join(titles)}")
+        sheet = workbook[settings.sheet] if settings.sheet is not None else workbook[titles[0]]
+        # A read-only sheet starts at its first filled row unless told otherwise, which would
+        # render worksheet row 3 as record 1 and shift every locator; ask from row 1.
+        for row in sheet.iter_rows(min_row=1, values_only=True):
+            yield [_cell_text(value) for value in row]
+    finally:
+        workbook.close()
+
+
 def _rows(path: Path, settings: FeedSettings) -> Iterator[list[str]]:
+    if path.suffix.lower() == ".xlsx":
+        yield from _xlsx_rows(path, settings)
+        return
     try:
         with path.open(encoding="utf-8-sig", newline="") as fh:
             yield from csv.reader(fh)
@@ -195,4 +234,7 @@ def split_table(path: Path, name: str, settings: FeedSettings) -> SplitResult:
     return SplitResult(units=units, headers=headers, renamed=renamed, warnings=warnings)
 
 
-SPLITTERS: dict[str, Callable[[Path, str, FeedSettings], SplitResult]] = {".csv": split_table}
+SPLITTERS: dict[str, Callable[[Path, str, FeedSettings], SplitResult]] = {
+    ".csv": split_table,
+    ".xlsx": split_table,
+}

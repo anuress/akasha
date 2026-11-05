@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import sys
+from datetime import date, datetime, time
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,22 @@ from akasha.splitters import FeedSettings, clean_headers, split
 def _csv(tmp_path: Path, text: str, name: str = "data.csv") -> Path:
     path = tmp_path / name
     path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _xlsx(tmp_path: Path, sheets: dict[str, list[list[object]]], name: str = "data.xlsx") -> Path:
+    """Build a workbook from sheet title -> rows, so a test states only what it exercises."""
+    openpyxl = pytest.importorskip("openpyxl")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for index, (title, rows) in enumerate(sheets.items()):
+        if index:
+            ws = wb.create_sheet()
+        ws.title = title
+        for row in rows:
+            ws.append(row)
+    path = tmp_path / name
+    wb.save(path)
     return path
 
 
@@ -282,3 +300,112 @@ def test_settings_json_round_trip_and_sha_stable():
     assert FeedSettings.from_json(settings.to_json()) == settings
     assert reordered.sha256() == settings.sha256()
     assert len(settings.sha256()) == 64
+
+
+def test_xlsx_splits_like_csv_with_worksheet_row_locators(tmp_path):
+    """An xlsx export is the same table, so a caller must not see a different result shape."""
+    path = _xlsx(
+        tmp_path,
+        {"Sheet1": [["City", "Country"], ["Paris", "France"], ["Lima", "Peru"]]},
+    )
+
+    result = split(path, "places", FeedSettings())
+
+    assert result.headers == ["City", "Country"]
+    assert [u.locator for u in result.units] == ["row:2", "row:3"]
+    assert result.units[0] == (
+        "row:2",
+        None,
+        "places row:2",
+        {"City": "Paris", "Country": "France"},
+    )
+
+
+def test_xlsx_values_render_dates_ints_bools_and_keep_error_strings(tmp_path):
+    """A cell value has to reach search as readable text, not as a repr of its Python type."""
+    path = _xlsx(
+        tmp_path,
+        {
+            "Sheet1": [
+                ["Name", "Day", "Seen", "Qty", "Active", "Ref", "At"],
+                [
+                    "Paris",
+                    date(2024, 3, 5),
+                    datetime(2024, 3, 5, 14, 30),
+                    42.0,
+                    True,
+                    "#REF!",
+                    time(9, 30),
+                ],
+                ["Lima", None, None, 7, False, "", None],
+            ]
+        },
+    )
+
+    result = split(path, "places", FeedSettings())
+
+    assert result.units[0].fields == {
+        "Name": "Paris",
+        "Day": "2024-03-05",
+        "Seen": "2024-03-05T14:30:00",
+        "Qty": "42",
+        "Active": "TRUE",
+        "Ref": "#REF!",
+        "At": "09:30:00",
+    }
+    assert result.units[1].fields == {"Name": "Lima", "Qty": "7", "Active": "FALSE"}
+
+
+def test_xlsx_uncached_formula_is_empty_not_None(tmp_path):
+    """A formula saved without a cached value reads as None, and "None" text would be a lie."""
+    path = _xlsx(tmp_path, {"Sheet1": [["Total", "Note"], ["=1+2", "ok"]]})
+
+    result = split(path, "places", FeedSettings())
+
+    assert result.units[0].fields == {"Note": "ok"}
+    assert "None" not in result.units[0].label
+
+
+def test_xlsx_sheet_setting_picks_tab_and_unknown_tab_lists_tabs(tmp_path):
+    """A workbook holds many tables; picking the wrong tab silently must not be possible."""
+    path = _xlsx(
+        tmp_path,
+        {"First": [["City"], ["Paris"]], "Second": [["Code"], ["P1"]]},
+    )
+
+    picked = split(path, "places", FeedSettings(sheet="Second"))
+    with pytest.raises(ValueError) as exc:
+        split(path, "places", FeedSettings(sheet="Nope"))
+
+    assert picked.headers == ["Code"]
+    assert picked.units[0].fields == {"Code": "P1"}
+    assert str(exc.value) == "data.xlsx: no sheet 'Nope'; sheets: First, Second"
+
+
+def test_xlsx_leading_empty_row_keeps_row_numbers(tmp_path):
+    """Read-only mode can start at the first filled row, which would shift every locator."""
+    openpyxl = pytest.importorskip("openpyxl")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A2"] = "City"
+    ws["A3"] = "Paris"
+    ws["A4"] = "Lima"
+    path = tmp_path / "data.xlsx"
+    wb.save(path)
+
+    result = split(path, "places", FeedSettings(header_row=2))
+
+    assert result.headers == ["City"]
+    assert [u.locator for u in result.units] == ["row:3", "row:4"]
+
+
+def test_xlsx_without_extra_raises_install_hint(tmp_path, monkeypatch):
+    """A missing optional dependency must name the install command, not raise a traceback."""
+    path = tmp_path / "data.xlsx"
+    path.write_bytes(b"")
+    monkeypatch.setitem(sys.modules, "openpyxl", None)
+
+    with pytest.raises(ValueError) as exc:
+        split(path, "places", FeedSettings())
+
+    assert str(exc.value) == "xlsx needs the extra: uv tool install 'akasha-mcp[xlsx]'"

@@ -30,6 +30,8 @@ akasha = "akasha.cli:main"
 [project.optional-dependencies]
 # Dense retrieval. Optional: akasha searches lexically without it.
 vectors = ["sqlite-vec>=0.1.9", "model2vec>=0.6", "numpy>=1.24"]
+# .xlsx table exports. Optional: the splitter names the extra when it is missing.
+xlsx = ["openpyxl>=3.1"]
 # pytest lives here for `uv run --extra dev ...` compatibility, and in the dev
 # dependency-group below so `uv run` syncs it via default-groups.
 dev = ["pytest>=8.0"]
@@ -40,6 +42,7 @@ dev = [
     "sqlite-vec>=0.1.9",
     "model2vec>=0.6",
     "numpy>=1.24",
+    "openpyxl>=3.1",
 ]
 
 [tool.uv]
