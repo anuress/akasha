@@ -10,6 +10,16 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, NamedTuple
 
+__all__ = [
+    "FeedSettings",
+    "Unit",
+    "SplitResult",
+    "split",
+    "SPLITTERS",
+    "clean_headers",
+    "split_table",
+]
+
 # Headers reach placeholders verbatim and may contain `:`, `!` and parentheses, so
 # `str.format` would misread them; only the placeholder braces themselves are syntax.
 _PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
@@ -115,10 +125,21 @@ def split(path: Path, name: str, settings: FeedSettings) -> SplitResult:
 
 def split_table(path: Path, name: str, settings: FeedSettings) -> SplitResult:
     records = enumerate(_rows(path, settings), start=1)
-    header = next(((n, row) for n, row in records if n >= settings.header_row), None)
-    if header is None:
-        return SplitResult(units=[], headers=[], renamed=[], warnings=[])
-    _, raw = header
+    raw = None
+    last = 0
+    for last, row in records:
+        if last >= settings.header_row:
+            raw = row
+            break
+    # An empty SplitResult would read downstream as "the table now has 0 rows" and wipe
+    # every stored unit, so a missing header is an error rather than an empty table.
+    if raw is None:
+        raise ValueError(
+            f"{path.name}: header_row {settings.header_row} is past the last record"
+            f" ({last} records)"
+        )
+    if not any(cell.strip() for cell in raw):
+        raise ValueError(f"{path.name}: header row {settings.header_row} is empty")
     headers, renamed = clean_headers(raw)
     for column in _requested(settings):
         if column not in headers:

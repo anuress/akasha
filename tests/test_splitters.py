@@ -31,6 +31,21 @@ def test_clean_headers_skips_suffix_taken_by_real_header():
     assert renamed == [("note", "note (3)")]
 
 
+def test_clean_headers_duplicate_suffix_does_not_rename_a_later_real_header():
+    """A duplicate's suffix must skip a name that a real header further along still needs."""
+    headers, _ = clean_headers(["note", "note", "NOTE (2)"])
+
+    assert headers == ["note", "note (3)", "NOTE (2)"]
+
+
+def test_column_letters_past_z_keep_counting():
+    """Past column 26 the generated name must keep going, not restart at A."""
+    headers, _ = clean_headers([""] * 27)
+
+    assert headers[:2] == ["col_A", "col_B"]
+    assert headers[26] == "col_AA"
+
+
 def test_locator_is_record_number_with_multiline_cells(tmp_path):
     """A locator has to match the spreadsheet row number even when a cell spans lines."""
     path = _csv(
@@ -54,6 +69,36 @@ def test_header_row_skips_title_rows(tmp_path):
     assert [u.locator for u in result.units] == ["row:3"]
 
 
+def test_header_row_past_last_record_raises(tmp_path):
+    """An empty result would read as "the table now has 0 rows" and wipe stored units."""
+    path = _csv(tmp_path, "City\nParis\n")
+
+    with pytest.raises(ValueError) as exc:
+        split(path, "places", FeedSettings(header_row=5))
+
+    assert str(exc.value) == "data.csv: header_row 5 is past the last record (2 records)"
+
+
+def test_empty_file_raises(tmp_path):
+    """A truncated export must fail loudly rather than look like a table with no rows."""
+    path = _csv(tmp_path, "")
+
+    with pytest.raises(ValueError) as exc:
+        split(path, "places", FeedSettings())
+
+    assert str(exc.value) == "data.csv: header_row 1 is past the last record (0 records)"
+
+
+def test_blank_header_record_raises(tmp_path):
+    """Generated col_A.. names would hide the column names every caller addresses."""
+    path = _csv(tmp_path, ",,\nParis,France,Lima\n")
+
+    with pytest.raises(ValueError) as exc:
+        split(path, "places", FeedSettings())
+
+    assert str(exc.value) == "data.csv: header row 1 is empty"
+
+
 def test_require_skips_rows_with_empty_required_column(tmp_path):
     """A unit without its required column is not addressable, so it must not be indexed."""
     path = _csv(tmp_path, "City,Country\nParis,France\nLima,\nBogota,Colombia\n")
@@ -61,6 +106,36 @@ def test_require_skips_rows_with_empty_required_column(tmp_path):
     result = split(path, "places", FeedSettings(require=["Country"]))
 
     assert [u.locator for u in result.units] == ["row:2", "row:4"]
+
+
+def test_require_naming_excluded_column_still_filters(tmp_path):
+    """A required column can be excluded from fields and still decide what is kept."""
+    path = _csv(tmp_path, "City,Country\nParis,France\nLima,\n")
+    settings = FeedSettings(require=["Country"], exclude=["Country"])
+
+    result = split(path, "places", settings)
+
+    assert [u.locator for u in result.units] == ["row:2"]
+    assert result.units[0].fields == {"City": "Paris"}
+
+
+def test_ragged_rows_are_padded_and_extra_cells_ignored(tmp_path):
+    """A missing trailing cell or an extra one must not shift another column's value."""
+    path = _csv(tmp_path, "City,Country,Motto\nParis,France\nLima,Peru,Sunny,extra\n")
+
+    result = split(path, "places", FeedSettings())
+
+    assert result.units[0].fields == {"City": "Paris", "Country": "France"}
+    assert result.units[1].fields == {"City": "Lima", "Country": "Peru", "Motto": "Sunny"}
+
+
+def test_whitespace_only_cells_are_left_out_of_fields(tmp_path):
+    """A space-only cell carries nothing, so it must not become a searchable field."""
+    path = _csv(tmp_path, "City,Country\nParis,   \n")
+
+    result = split(path, "places", FeedSettings())
+
+    assert result.units[0].fields == {"City": "Paris"}
 
 
 def test_duplicate_keys_fall_back_to_row_locator_with_one_warning(tmp_path):
@@ -94,6 +169,16 @@ def test_exclude_drops_columns_from_fields(tmp_path):
     assert result.units[0].fields == {"City": " Paris ", "Country": "France"}
 
 
+def test_key_in_exclude_column_is_still_computed(tmp_path):
+    """Excluding a column hides it from fields; the key still has to address the row."""
+    path = _csv(tmp_path, "City,Country\nParis,France\nLima,Peru\n")
+
+    result = split(path, "places", FeedSettings(key="City", exclude=["City"]))
+
+    assert [u.key for u in result.units] == ["Paris", "Lima"]
+    assert all("City" not in u.fields for u in result.units)
+
+
 @pytest.mark.parametrize(
     "settings",
     [
@@ -124,6 +209,17 @@ def test_label_template_fills_columns_and_default_is_name_and_key_or_locator(tmp
     assert [u.label for u in templated.units] == ["France / Paris", "/ Lima"]
     assert [u.label for u in by_key.units] == ["places Paris", "places Lima"]
     assert [u.label for u in no_key.units] == ["places row:2", "places row:3"]
+
+
+def test_label_placeholder_naming_excluded_column_still_renders(tmp_path):
+    """A label may name a column that is deliberately not a field."""
+    path = _csv(tmp_path, "City,Country\nParis,France\n")
+    settings = FeedSettings(label="{City} - {Country}", exclude=["Country"])
+
+    result = split(path, "places", settings)
+
+    assert result.units[0].label == "Paris - France"
+    assert result.units[0].fields == {"City": "Paris"}
 
 
 def test_csv_with_bom_reads_first_header_cleanly(tmp_path):
