@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Callable, Iterator, NamedTuple
+from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile
 
 __all__ = [
@@ -126,21 +127,21 @@ def _xlsx_rows(path: Path, settings: FeedSettings) -> Iterator[list[str]]:
         raise ValueError("xlsx needs the extra: uv tool install 'akasha-mcp[xlsx]'") from None
     try:
         workbook = load_workbook(path, read_only=True, data_only=True)
-    except (BadZipFile, InvalidFileException, KeyError, EOFError, OSError) as exc:
-        # A corrupt, truncated or encrypted export is bad input, not a crash each caller has
-        # to learn to catch; every other splitter failure is a ValueError.
+        try:
+            titles = workbook.sheetnames
+            if settings.sheet is not None and settings.sheet not in titles:
+                raise ValueError(f"{path.name}: no sheet '{settings.sheet}'; sheets: {', '.join(titles)}")
+            sheet = workbook[settings.sheet] if settings.sheet is not None else workbook[titles[0]]
+            # A read-only sheet starts at its first filled row unless told otherwise, which would
+            # render worksheet row 3 as record 1 and shift every locator; ask from row 1.
+            for row in sheet.iter_rows(min_row=1, values_only=True):
+                yield [_cell_text(value) for value in row]
+        finally:
+            workbook.close()
+    except (BadZipFile, InvalidFileException, ParseError, KeyError, EOFError) as exc:
+        # Damage inside an otherwise readable zip only surfaces while the rows are parsed, and
+        # the feed caller catches ValueError for every splitter failure; OS errors stay as they are.
         raise ValueError(f"{path.name}: not a readable .xlsx workbook") from exc
-    try:
-        titles = workbook.sheetnames
-        if settings.sheet is not None and settings.sheet not in titles:
-            raise ValueError(f"{path.name}: no sheet '{settings.sheet}'; sheets: {', '.join(titles)}")
-        sheet = workbook[settings.sheet] if settings.sheet is not None else workbook[titles[0]]
-        # A read-only sheet starts at its first filled row unless told otherwise, which would
-        # render worksheet row 3 as record 1 and shift every locator; ask from row 1.
-        for row in sheet.iter_rows(min_row=1, values_only=True):
-            yield [_cell_text(value) for value in row]
-    finally:
-        workbook.close()
 
 
 def _rows(path: Path, settings: FeedSettings) -> Iterator[list[str]]:

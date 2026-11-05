@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+import zipfile
 from datetime import date, datetime, time
 from pathlib import Path
 
@@ -422,3 +423,28 @@ def test_xlsx_unreadable_file_raises_clear_error(tmp_path):
 
     assert str(exc.value) == "data.xlsx: not a readable .xlsx workbook"
     assert exc.value.__cause__ is not None
+
+
+def test_xlsx_damaged_sheet_xml_raises_clear_error(tmp_path):
+    """Sheet XML is parsed lazily, so damage in a valid zip must still reach the caller as ValueError."""
+    pytest.importorskip("openpyxl")
+    path = _xlsx(tmp_path, {"Sheet1": [["City"], ["Paris"]]})
+    with zipfile.ZipFile(path) as source:
+        entries = {name: source.read(name) for name in source.namelist()}
+    entries["xl/worksheets/sheet1.xml"] = b"<worksheet><sheetData><row"
+    with zipfile.ZipFile(path, "w") as target:
+        for name, data in entries.items():
+            target.writestr(name, data)
+
+    with pytest.raises(ValueError) as exc:
+        split(path, "places", FeedSettings())
+
+    assert str(exc.value) == "data.xlsx: not a readable .xlsx workbook"
+
+
+def test_xlsx_missing_file_raises_os_error(tmp_path):
+    """A path that is not there is a caller mistake the OS already names, so it must not be disguised."""
+    pytest.importorskip("openpyxl")
+
+    with pytest.raises(FileNotFoundError):
+        split(tmp_path / "missing.xlsx", "places", FeedSettings())
