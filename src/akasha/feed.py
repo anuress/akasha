@@ -1,26 +1,52 @@
-"""Attach a dataset's units to its document as search chunks, rebuilding them if stale.
+"""Feed a table export into a dataset document, and attach its units as chunks.
 
 The units are the dataset's cells; search reads the chunks made from them. Splitting is
 the expensive part, so it happens only when the copy, its settings or the scan policy
-changed. Nothing here commits: an attach belongs in the caller's transaction, together
-with the document row and the chunks it replaces. A broken dataset must never stop an
-index run, so its data problems are recorded and reported instead of raised.
+changed. Attaching belongs in the caller's transaction, together with the document row
+and the chunks it replaces. A broken dataset must never stop an index run, so its data
+problems are recorded and reported instead of raised.
+
+`feed` produces that document, its units and its copy in one step that either lands
+entirely or leaves the previous feed untouched.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
-from akasha import feed_store, splitters
+from akasha import feed_store, gitctx, kinds, knowledge, markdown, splitters, vectors
 from akasha.config import Config
 from akasha.events import emit
+from akasha.feed_store import Change, Diff
 from akasha.security import (INJECTION_PATTERNS, INJECTION_STRIP_RULES, SECRET_PATTERNS,
-                             redact, scrub_injection)
+                             is_denied, redact, scrub_injection)
 from akasha.splitters import FeedSettings, Unit
 
-__all__ = ["ATTACH_ERRORS", "DatasetReadOnly", "attach", "redact_units", "unit_state"]
+__all__ = [
+    "ATTACH_ERRORS",
+    "DatasetReadOnly",
+    "FeedResult",
+    "LARGE_FILE_BYTES",
+    "attach",
+    "feed",
+    "redact_units",
+    "unit_state",
+]
+
+ALLOWED_SUFFIXES = (".csv", ".xlsx")
+
+# Above this the feed still happens: the warning says what it will cost.
+LARGE_FILE_BYTES = 50 * 1024 * 1024
+
+# A change-log line names what moved, never a cell value, so the log stays readable.
+CHANGE_LINE_CAP = 50
+
+CHANGE_LOG = "## Change log"
 
 
 class DatasetReadOnly(ValueError):
@@ -177,3 +203,261 @@ def attach(conn: sqlite3.Connection, cfg: Config, doc_id: str, meta: dict, *,
         ATTACH_ERRORS.append((name, str(exc)))
         emit(conn, "feed.attach_failed", commit=False, dataset=name, error=str(exc))
         return _insert_chunks(conn, doc_id, name, feed_store.load_units(conn, name))
+
+
+@dataclass
+class FeedResult:
+    """What one feed did: where the copy went, what it holds, and what changed."""
+
+    name: str
+    repo: str
+    doc_id: str
+    copy: Path
+    units: int
+    diff: Diff | None
+    unchanged: bool
+    renamed: list[tuple[str, str]]
+    warnings: list[str]
+    redacted: int
+
+
+def _copy_path(cfg: Config, repo: str, name: str, suffix: str) -> Path:
+    return cfg.knowledge_dir.parent / "files" / repo / f"{name}{suffix}"
+
+
+def _dataset_doc(cfg: Config, name: str) -> Path | None:
+    """The dataset document of a name, whichever repo folder holds it.
+
+    The name is global, so an existing document under another repo is what makes a feed
+    there a refusal rather than a second, silently diverging dataset.
+    """
+    for candidate in sorted(cfg.knowledge_dir.glob(f"*/datasets/{name}.md")):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _repo_name(cfg: Config, repo: str) -> str:
+    """The repo names a directory under the knowledge dir, so it gets the same check as
+    `knowledge.write`: a plain name, and a folder that stays inside the knowledge dir."""
+    folder = cfg.knowledge_dir / repo
+    if (not knowledge._REPO_NAME.fullmatch(repo) or repo in (".", "..")
+            or not folder.resolve().is_relative_to(cfg.knowledge_dir.resolve())):
+        raise ValueError(
+            f"invalid repo {repo!r}: use a plain name of letters, digits, '.', '_' and '-'")
+    return repo
+
+
+def _resolve_repo(cfg: Config, repo: str | None) -> str:
+    if repo == "*":
+        raise ValueError("invalid repo '*': a dataset belongs to one repo")
+    if repo:
+        return _repo_name(cfg, repo)
+    derived, _source = gitctx.resolve_repo(cfg, Path.cwd(), None)
+    return _repo_name(cfg, derived) if derived else "_global"
+
+
+def _unit_line(unit: Unit) -> str:
+    identity = f"key:{unit.key}" if unit.key is not None else unit.locator
+    names = ", ".join(sorted(unit.fields))
+    return f"- {identity} {unit.label}" + (f": {names}" if names else "")
+
+
+def _change_line(change: Change) -> str:
+    names = ", ".join(change.fields)
+    return f"- {change.identity} {change.label}" + (f": {names}" if names else "")
+
+
+def _change_section(units: int, changes: Diff | None) -> str:
+    """One dated section: what the feed counted, then what moved.
+
+    Lines carry identities and field names only. A cell value would grow the log without
+    bound and put into a document what redaction exists to keep out of one.
+    """
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    lines = [f"### {stamp}"]
+    if changes is None:
+        lines.append(f"first feed: {units} units")
+        return "\n".join(lines)
+    lines.append(f"+{len(changes.added)} -{len(changes.removed)} ~{len(changes.changed)}")
+    entries = ([_unit_line(unit) for unit in changes.added]
+               + [_unit_line(unit) for unit in changes.removed]
+               + [_change_line(change) for change in changes.changed])
+    lines.extend(entries[:CHANGE_LINE_CAP])
+    if len(entries) > CHANGE_LINE_CAP:
+        lines.append(f"- … and {len(entries) - CHANGE_LINE_CAP} more")
+    return "\n".join(lines)
+
+
+def _earlier_sections(previous_body: str | None) -> str:
+    """The change log of the document being replaced, carried below the new section."""
+    if not previous_body:
+        return ""
+    marker = previous_body.find(CHANGE_LOG)
+    return previous_body[marker + len(CHANGE_LOG):].strip("\n") if marker >= 0 else ""
+
+
+def _doc_body(name: str, original: str, units: list[Unit], headers: list[str],
+              changes: Diff | None, previous_body: str | None) -> str:
+    today = datetime.now(timezone.utc).date().isoformat()
+    sections = [
+        f"Fed from {original} on {today}: {len(units)} units, {len(headers)} fields.",
+        "## Fields",
+        "\n".join(f"- {header}" for header in headers),
+        "## How to read rows",
+        "Each cell is stored on its own. Read a row with "
+        f"`knowledge_feed_get(name, locator)` (the locator looks like `row:2`) or filter "
+        f"rows with `knowledge_feed_query(name, where)`; this dataset is `{name}`.",
+        CHANGE_LOG,
+        _change_section(len(units), changes),
+    ]
+    earlier = _earlier_sections(previous_body)
+    if earlier:
+        sections.append(earlier)
+    return "\n\n".join(sections) + "\n"
+
+
+def _move_copies_aside(cfg: Config, repo: str, name: str) -> list[tuple[Path, Path]]:
+    """Rename every copy of this name out of the way, whichever extension it has.
+
+    A feed that changes the extension leaves the old copy with no name to live at, so the
+    backup is what the rollback restores and what the caller trashes afterwards.
+    """
+    moved: list[tuple[Path, Path]] = []
+    for suffix in ALLOWED_SUFFIXES:
+        old = _copy_path(cfg, repo, name, suffix)
+        if not old.exists():
+            continue
+        backup = Path(f"{old}.bak")
+        os.replace(old, backup)
+        moved.append((backup, old))
+    return moved
+
+
+def feed(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
+         settings: FeedSettings | None = None, repo: str | None = None) -> FeedResult:
+    """Copy a table export into the knowledge base and make its cells searchable.
+
+    Order matters for crash safety: everything that can refuse the file happens before a
+    byte is written, the copy and the document are written outside the transaction (a file
+    cannot be rolled back), and the unit rows, the document row and its chunks land in one
+    transaction whose failure restores the files it replaced.
+    """
+    path = Path(path)
+    reason = kinds.custom_kind_error(name)
+    if reason is not None:
+        raise ValueError(f"invalid dataset name {name!r}: {reason}")
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} does not exist")
+    suffix = path.suffix.lower()
+    if suffix not in ALLOWED_SUFFIXES:
+        raise ValueError(
+            f"unsupported file type '{suffix}'; accepted: {', '.join(ALLOWED_SUFFIXES)}")
+    if is_denied(path, cfg):
+        raise PermissionError(f"{path} is on the deny list and is never fed")
+    # One read: the sha the document records must describe the bytes that were copied.
+    data = path.read_bytes()
+    warnings: list[str] = []
+    if len(data) > LARGE_FILE_BYTES:
+        warnings.append(f"{path.name} is {len(data) / (1024 * 1024):.0f} MB; feeding anyway")
+    resolved_repo = _resolve_repo(cfg, repo)
+    doc_path = cfg.knowledge_dir / resolved_repo / "datasets" / f"{name}.md"
+    existing = _dataset_doc(cfg, name)
+    previous_text = existing.read_text() if existing is not None else None
+    previous_meta = markdown.parse_frontmatter(previous_text)[0] if previous_text else {}
+    if existing is not None:
+        owner = previous_meta.get("repo") or existing.parent.parent.name
+        if owner != resolved_repo:
+            raise ValueError(
+                f"'{name}' is fed under repo {owner}; use another name or "
+                f"`akasha feed rm {name}` first")
+    if settings is None:
+        if existing is None:
+            raise ValueError(f"first feed of '{name}' needs settings (at least key)")
+        settings = _settings_from(previous_meta, name)
+
+    copy = _copy_path(cfg, resolved_repo, name, suffix)
+    file_sha = hashlib.sha256(data).hexdigest()
+    state = unit_state(file_sha, settings.sha256(), cfg)
+    stored = feed_store.load_units(conn, name)
+    indexed = conn.execute(
+        "SELECT id FROM documents WHERE path = ? AND deleted_at IS NULL",
+        (str(doc_path),)).fetchone()
+    if (existing is not None and indexed is not None and stored
+            and feed_store.stored_state(conn, name) == state):
+        return FeedResult(name=name, repo=resolved_repo, doc_id=indexed["id"], copy=copy,
+                          units=len(stored), diff=None, unchanged=True, renamed=[],
+                          warnings=warnings, redacted=0)
+
+    split_result = splitters.split(path, name, settings)
+    units, redacted = redact_units(split_result.units, cfg)
+    changes = feed_store.diff(stored, units) if existing is not None else None
+    if "dataset" not in cfg.custom_kinds:
+        # Before the transaction: registering rewrites the config file and commits its
+        # event, neither of which a rollback of the dataset could undo.
+        knowledge._register_custom_kind(conn, cfg, "dataset")
+    meta = {
+        "title": f"Dataset: {name}",
+        "kind": "dataset",
+        "feature": name,
+        "repo": resolved_repo,
+        "dataset": name,
+        "file": str(copy),
+        "sha256": file_sha,
+        "settings_sha256": settings.sha256(),
+        "settings": json.loads(settings.to_json()),
+    }
+    text = markdown.render(
+        meta, _doc_body(name, path.name, units, split_result.headers, changes, previous_text))
+
+    copy.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(f"{copy}.tmp")
+    tmp.write_bytes(data)
+    backups = _move_copies_aside(cfg, resolved_repo, name)
+    os.replace(tmp, copy)
+    attach_failures_before = len(ATTACH_ERRORS)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        feed_store.replace_units(conn, name, units, state)
+        doc_path.parent.mkdir(parents=True, exist_ok=True)
+        doc_path.write_text(text)
+        knowledge._reindex(conn, cfg, doc_path, commit=False)
+        failures = [message for dataset, message in ATTACH_ERRORS[attach_failures_before:]
+                    if dataset == name]
+        if failures:
+            # attach records a data problem and keeps the last good units; for a feed, the
+            # units it just stored are not what got attached, so it is a failed write.
+            raise ValueError(failures[0])
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        # A backup restores its own name, so unlinking the new copy is right unless one of
+        # them is that name: a feed that changed the extension renamed the old copy away.
+        if all(original != copy for _backup, original in backups):
+            copy.unlink(missing_ok=True)
+        for backup, original in backups:
+            os.replace(backup, original)
+        tmp.unlink(missing_ok=True)
+        if previous_text is None:
+            doc_path.unlink(missing_ok=True)
+        else:
+            doc_path.write_text(previous_text)
+        raise
+
+    for backup, original in backups:
+        if original == copy:
+            backup.unlink(missing_ok=True)
+        else:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            trashed = (cfg.knowledge_dir.parent / "files" / ".trash" / resolved_repo
+                       / f"{name}-{stamp}{original.suffix}")
+            trashed.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(backup, trashed)
+    vectors.index_chunks(conn, cfg)
+
+    row = conn.execute("SELECT id FROM documents WHERE path = ?",
+                       (str(doc_path),)).fetchone()
+    return FeedResult(name=name, repo=resolved_repo, doc_id=row["id"], copy=copy,
+                      units=len(units), diff=changes, unchanged=False,
+                      renamed=split_result.renamed, warnings=warnings, redacted=redacted)
