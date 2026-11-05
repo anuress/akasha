@@ -409,3 +409,16 @@ def test_xlsx_without_extra_raises_install_hint(tmp_path, monkeypatch):
         split(path, "places", FeedSettings())
 
     assert str(exc.value) == "xlsx needs the extra: uv tool install 'akasha-mcp[xlsx]'"
+
+
+def test_xlsx_unreadable_file_raises_clear_error(tmp_path):
+    """A corrupt or encrypted export must name the file, not leak a zipfile traceback the caller does not catch."""
+    pytest.importorskip("openpyxl")
+    path = tmp_path / "data.xlsx"
+    path.write_bytes(b"not a zip")
+
+    with pytest.raises(ValueError) as exc:
+        split(path, "places", FeedSettings())
+
+    assert str(exc.value) == "data.xlsx: not a readable .xlsx workbook"
+    assert exc.value.__cause__ is not None

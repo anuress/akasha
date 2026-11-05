@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Callable, Iterator, NamedTuple
+from zipfile import BadZipFile
 
 __all__ = [
     "FeedSettings",
@@ -120,9 +121,15 @@ def _cell_text(value: object) -> str:
 def _xlsx_rows(path: Path, settings: FeedSettings) -> Iterator[list[str]]:
     try:
         from openpyxl import load_workbook
+        from openpyxl.utils.exceptions import InvalidFileException
     except ImportError:
         raise ValueError("xlsx needs the extra: uv tool install 'akasha-mcp[xlsx]'") from None
-    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        workbook = load_workbook(path, read_only=True, data_only=True)
+    except (BadZipFile, InvalidFileException, KeyError, EOFError, OSError) as exc:
+        # A corrupt, truncated or encrypted export is bad input, not a crash each caller has
+        # to learn to catch; every other splitter failure is a ValueError.
+        raise ValueError(f"{path.name}: not a readable .xlsx workbook") from exc
     try:
         titles = workbook.sheetnames
         if settings.sheet is not None and settings.sheet not in titles:
