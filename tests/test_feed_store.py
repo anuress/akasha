@@ -129,6 +129,15 @@ def test_diff_keeps_content_lines_starting_with_dashes_or_pluses():
     assert result.changed[0].lines == ["note: --- note", "note: +++ x"]
 
 
+def test_diff_keeps_content_lines_that_equal_header_strings():
+    """A cell line of exactly `-- ` renders as `--- `, the same string as a diff header,
+    so the header must be recognised by where it is rather than by what it says."""
+    result = feed_store.diff(
+        [_unit("row:2", note="-- ")], [_unit("row:2", note="++ ")])
+
+    assert result.changed[0].lines == ["note: --- ", "note: +++ "]
+
+
 def test_diff_label_only_change_is_reported():
     """A relabelled row changed the text the caller's search shows even though no cell
     moved, so it must be a change with no field lines rather than no change at all."""

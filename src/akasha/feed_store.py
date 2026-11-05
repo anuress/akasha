@@ -144,11 +144,12 @@ def _change(old: Unit, new: Unit, identity: str, line_cap: int) -> Change | None
         diff = difflib.unified_diff(
             (old.fields.get(name) or "").splitlines(),
             (new.fields.get(name) or "").splitlines(), lineterm="", n=0)
-        # A per-field diff's header is exactly "--- " / "+++ ", because lineterm is
-        # empty; a content line is that prefix plus the cell's line, so a cell starting
-        # with `--` arrives as "--- note" and must survive. Hence whole-line compare.
-        lines.extend(f"{name}: {line}" for line in diff
-                     if line not in ("--- ", "+++ ") and not line.startswith("@@"))
+        # The two header lines are skipped by position, not by text: `unified_diff`
+        # always yields them first when the values differ, and a cell line of exactly
+        # `-- ` renders as `--- `, indistinguishable from the header by content. Hunk
+        # headers can be skipped by text because every content line starts `+` or `-`.
+        body = list(diff)[2:]
+        lines.extend(f"{name}: {line}" for line in body if not line.startswith("@@"))
     if line_cap:
         lines = lines[:line_cap]
     return Change(identity=identity, label=new.label, fields=names, lines=lines)
