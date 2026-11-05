@@ -119,14 +119,22 @@ def test_require_naming_excluded_column_still_filters(tmp_path):
     assert result.units[0].fields == {"City": "Paris"}
 
 
-def test_ragged_rows_are_padded_and_extra_cells_ignored(tmp_path):
-    """A missing trailing cell or an extra one must not shift another column's value."""
-    path = _csv(tmp_path, "City,Country,Motto\nParis,France\nLima,Peru,Sunny,extra\n")
+def test_short_row_missing_trailing_required_cell_counts_as_empty(tmp_path):
+    """A short row must read as an empty required cell, not crash the filter."""
+    path = _csv(tmp_path, "City,Country,Motto\nParis,France\nLima,Peru,Sunny\n")
+
+    result = split(path, "places", FeedSettings(require=["Motto"]))
+
+    assert [u.locator for u in result.units] == ["row:3"]
+
+
+def test_row_whose_only_value_is_past_header_width_is_skipped(tmp_path):
+    """A cell past the header width has no column, so it cannot make an empty row real."""
+    path = _csv(tmp_path, "City,Country\n,,extra\nParis,France\n")
 
     result = split(path, "places", FeedSettings())
 
-    assert result.units[0].fields == {"City": "Paris", "Country": "France"}
-    assert result.units[1].fields == {"City": "Lima", "Country": "Peru", "Motto": "Sunny"}
+    assert [u.locator for u in result.units] == ["row:3"]
 
 
 def test_whitespace_only_cells_are_left_out_of_fields(tmp_path):
