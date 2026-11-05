@@ -563,3 +563,52 @@ def test_search_hit_on_markdown_chunk_has_no_unit(env):
 
     assert hit.unit is None
     assert "unit" not in hit.as_dict()
+
+
+def _feed_row(conn, cfg, tmp_path, name, rows):
+    from akasha import feed
+    from akasha.splitters import FeedSettings
+
+    path = tmp_path / f"{name}.csv"
+    path.write_text(rows, encoding="utf-8")
+    feed.feed(conn, cfg, path, name, FeedSettings(key="item"), repo="sample-repo")
+
+
+def test_search_hint_quotes_keys_with_special_characters(env, tmp_path):
+    """A key is data from an export, and a quote, a backslash or a newline in it would
+    otherwise turn the hint into a call that does not parse; both arguments are quoted as
+    JSON, which leaves an ordinary value looking exactly as before."""
+    import json
+
+    from akasha import feed
+
+    conn, cfg = env
+    _feed_row(conn, cfg, tmp_path, "quoted", 'item,note\n"a""b\\c",quotedcell\n')
+
+    unit = search(conn, "quotedcell", repo="sample-repo")[0].unit
+    key = 'a"b\\c'
+
+    assert unit["key"] == key
+    hint = unit["next"]
+    assert hint.startswith("knowledge_feed_get(name=")
+    name_arg, locator_arg = hint[len("knowledge_feed_get("):-1].split(", ", 1)
+    assert json.loads(name_arg.removeprefix("name=")) == "quoted"
+    assert json.loads(locator_arg.removeprefix("locator=")) == f"key:{key}"
+    assert feed.get_unit(conn, "quoted", f"key:{key}").fields["note"] == "quotedcell"
+
+
+def test_search_hint_falls_back_to_the_row_when_the_unit_has_no_key(env, tmp_path):
+    """A duplicate key is stored as None, so the hint has to address the row instead: a
+    key two rows share would name a unit get_unit cannot resolve."""
+    from akasha import feed
+
+    conn, cfg = env
+    _feed_row(conn, cfg, tmp_path, "dupes", "item,price\nbolt,4\nbolt,5\n")
+
+    unit = search(conn, "bolt", repo="sample-repo")[0].unit
+
+    assert unit["key"] is None
+    assert unit["locator"].startswith("row:")
+    assert unit["next"] == (
+        f'knowledge_feed_get(name="dupes", locator="{unit["locator"]}")')
+    assert feed.get_unit(conn, "dupes", unit["locator"]).fields["price"] in {"4", "5"}

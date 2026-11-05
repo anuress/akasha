@@ -125,3 +125,28 @@ def test_cell_with_separator_newlines_and_heading_round_trips_verbatim(fed):
     write(rows='item,note\nbolt,"a · b\n# heading\nc"\n')
 
     assert feed.get_unit(conn, "prices", "row:2").fields["note"] == cell
+
+
+def test_query_unknown_dataset_is_a_keyerror_like_get_unit(fed):
+    """A filter on a dataset that was never fed must say so: an empty list, or an
+    unknown-field message with no field names in it, hides which mistake was made."""
+    conn, write = fed
+    write()
+
+    with pytest.raises(KeyError, match=r"no dataset 'absent'"):
+        feed.query_units(conn, "absent")
+    with pytest.raises(KeyError, match=r"no dataset 'absent'"):
+        feed.query_units(conn, "absent", ["item=bolt"])
+
+
+def test_a_field_missing_from_earlier_rows_is_filterable_and_projectable(fed):
+    """An empty cell is left out of that row's fields, so the dataset's fields are the
+    union across rows; a field only a later row carries must still be filterable and
+    projectable."""
+    conn, write = fed
+    write(rows="item,note\nbolt,\nnut,fastener\n")
+
+    assert [u.key for u in feed.query_units(conn, "prices", ["note~fasten"])] == ["nut"]
+    projected = feed.query_units(conn, "prices", fields=["note"])
+    assert [(u.key, u.fields) for u in projected] == [
+        ("bolt", {}), ("nut", {"note": "fastener"})]

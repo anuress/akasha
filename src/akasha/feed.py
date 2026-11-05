@@ -570,13 +570,15 @@ def _field_names(units: list[Unit]) -> list[str]:
     return sorted({field for unit in units for field in unit.fields})
 
 
-def _require_dataset(conn: sqlite3.Connection, name: str) -> None:
-    """Refuse a name that was never fed.
+def _dataset_units(conn: sqlite3.Connection, name: str) -> list[Unit]:
+    """The stored units, or the KeyError for a name nothing was ever fed under.
 
     No units only means the dataset is empty when a stored state says it was fed; with
     neither, the caller named a dataset that does not exist."""
-    if not feed_store.load_units(conn, name) and feed_store.stored_state(conn, name) is None:
+    units = feed_store.load_units(conn, name)
+    if not units and feed_store.stored_state(conn, name) is None:
         raise KeyError(f"no dataset '{name}'")
+    return units
 
 
 def get_unit(conn: sqlite3.Connection, name: str, locator: str) -> Unit:
@@ -591,7 +593,7 @@ def get_unit(conn: sqlite3.Connection, name: str, locator: str) -> Unit:
         "SELECT locator, key, label, fields FROM feed_units"
         f" WHERE dataset = ? AND {column} = ?", (name, value)).fetchone()
     if row is None:
-        _require_dataset(conn, name)
+        _dataset_units(conn, name)      # an unknown dataset outranks an unknown locator
         raise KeyError(f"no unit {locator} in '{name}'")
     return Unit(locator=row["locator"], key=row["key"], label=row["label"],
                 fields=json.loads(row["fields"]))
@@ -603,9 +605,10 @@ def query_units(conn: sqlite3.Connection, name: str, where: list[str] | tuple = 
 
     An item is `field=value` (the whole cell equals it) or `field~value` (the cell
     contains it), split at its first operator so a value may hold one too. Both compare
-    case-insensitively, because the caller's spelling is not the export's.
+    case-insensitively, because the caller's spelling is not the export's. An unknown
+    dataset fails like `get_unit`: an empty result would not say which mistake was made.
     """
-    units = feed_store.load_units(conn, name)
+    units = _dataset_units(conn, name)
     known = _field_names(units)
 
     def checked(field: str) -> str:
