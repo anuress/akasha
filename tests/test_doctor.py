@@ -515,3 +515,49 @@ def test_an_attach_failure_for_a_removed_dataset_is_history(env):
     emit(conn, "feed.attach_failed", dataset="removed", error="gone")
 
     assert not [f for f in _run(env) if f.kind == "dataset_attach"]
+
+
+def test_the_latest_attach_failure_is_the_one_reported(env, tmp_path):
+    """An older error sends the reader after a cause that is already gone."""
+    conn, _cfg, _home = env
+    _feed_csv(env, tmp_path)
+    emit(conn, "feed.attach_failed", dataset="prices", error="an older failure")
+    emit(conn, "feed.attach_failed", dataset="prices", error="the newer failure")
+    conn.execute("DELETE FROM meta WHERE key = 'feed_state:prices'")
+
+    findings = [f for f in _run(env) if f.kind == "dataset_attach"]
+
+    assert len(findings) == 1
+    assert "the newer failure" in findings[0].detail
+    assert "an older failure" not in findings[0].detail
+
+
+def test_an_xlsx_dataset_with_the_extra_installed_is_silent(env, tmp_path):
+    """The extra is news only while it is missing."""
+    conn, cfg, _home = env
+    openpyxl = pytest.importorskip("openpyxl")
+    workbook = openpyxl.Workbook()
+    for row in (("item", "price"), ("bolt", 4)):
+        workbook.active.append(list(row))
+    source = tmp_path / "prices.xlsx"
+    workbook.save(source)
+    feed.feed(conn, cfg, source, "prices", settings=FeedSettings(key="item"),
+              repo="sample-repo")
+
+    assert "xlsx" not in _kinds(_run(env))
+
+
+def test_doctor_reads_the_dataset_documents_once(env, tmp_path, monkeypatch):
+    """Every dataset check parses the same documents, so one read must serve them all."""
+    _feed_csv(env, tmp_path)
+    calls: list[int] = []
+    real = doctor.dataset_documents
+
+    def counting(conn):
+        calls.append(1)
+        return real(conn)
+
+    monkeypatch.setattr(doctor, "dataset_documents", counting)
+    _run(env)
+
+    assert len(calls) == 1

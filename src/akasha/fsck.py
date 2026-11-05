@@ -170,13 +170,23 @@ def _near_duplicates(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:
     return findings
 
 
-def dataset_documents(conn: sqlite3.Connection) -> list[tuple[str, dict]]:
-    """Each active dataset document's id and its file's frontmatter.
+DATASET_META_KEYS = ("dataset", "file", "sha256", "settings_sha256")
 
-    Shared with `doctor`, so both report on the same documents. A document whose file is
-    gone is skipped: `missing_file` already owns absent paths.
+
+def _missing_meta(meta: dict) -> list[str]:
+    """The keys a check cannot act without: absent, or not a non-empty string."""
+    return [key for key in DATASET_META_KEYS
+            if not isinstance(meta.get(key), str) or not meta[key]]
+
+
+def _dataset_records(conn: sqlite3.Connection) -> list[tuple[str, Path, dict, list[str]]]:
+    """Every active dataset document: id, doc path, its frontmatter, and what it lacks.
+
+    `missing` is empty for a document `feed` wrote and names the keys that are absent or
+    unusable otherwise, so a damaged document is reported instead of disappearing from every
+    check. A document whose file is gone is skipped: `missing_file` owns absent paths.
     """
-    found: list[tuple[str, dict]] = []
+    records: list[tuple[str, Path, dict, list[str]]] = []
     for row in conn.execute(
         "SELECT id, path FROM documents WHERE deleted_at IS NULL"
         " AND status != 'archived' AND kind = 'dataset'"
@@ -185,17 +195,27 @@ def dataset_documents(conn: sqlite3.Connection) -> list[tuple[str, dict]]:
         if not file.is_file():
             continue
         meta, _body = parse_frontmatter(file.read_text(errors="replace"))
-        if meta.get("dataset"):
-            found.append((row["id"], meta))
-    return found
+        records.append((row["id"], file, meta, _missing_meta(meta)))
+    return records
 
 
-def _leftovers(cfg: Config, named: set[Path]) -> list[Finding]:
+def dataset_documents(conn: sqlite3.Connection) -> list[tuple[str, dict]]:
+    """Each usable active dataset document's id and its file's frontmatter.
+
+    Shared with `doctor`, so both report on the same documents.
+    """
+    return [(doc_id, meta) for doc_id, _path, meta, missing in _dataset_records(conn)
+            if not missing]
+
+
+def _leftovers(cfg: Config, named: set[Path], unreadable: set[str]) -> list[Finding]:
     """Files no dataset names, and what an interrupted feed left in the files dir.
 
     One level under `files/<repo>/`. `.trash` holds what a replaced copy became and `.locks`
     the feed locks, so both are deliberate. A staging or backup file is reported as a
-    leftover rather than an orphan: it needs deleting, not identifying.
+    leftover rather than an orphan: it needs deleting, not identifying. A copy whose name
+    matches a dataset document nobody could read is not an orphan either: that document is
+    the finding, and the copy is what a re-feed is checked against.
     """
     files_dir = cfg.knowledge_dir.parent / "files"
     if not files_dir.is_dir():
@@ -210,10 +230,14 @@ def _leftovers(cfg: Config, named: set[Path]) -> list[Finding]:
                     "dataset_leftover_temp", "warning", None,
                     f"{entry} is left from an interrupted feed; safe to delete once no "
                     "feed is running"))
-            elif entry.resolve() not in named:
+            elif entry.resolve() in named:
+                continue             # a readable document claims this copy
+            elif entry.stem in unreadable:
+                continue             # a damaged document's copy; `_datasets` reports it
+            else:
                 findings.append(Finding(
                     "dataset_copy_orphan", "warning", None,
-                    f"{entry} is no dataset's copy; delete it or feed it again"))
+                    f"{entry} is named by no readable dataset document"))
     return findings
 
 
@@ -225,12 +249,23 @@ def _datasets(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:
     """
     findings: list[Finding] = []
     named: set[Path] = set()
-    for doc_id, meta in dataset_documents(conn):
+    unreadable: set[str] = set()
+    for doc_id, doc_path, meta, missing in _dataset_records(conn):
+        if meta.get("file"):
+            # A damaged document still names its copy, and that copy is what a re-feed is read
+            # from: calling it an orphan would advise deleting the one file to keep.
+            named.add(Path(str(meta["file"])).resolve())
+        if missing:
+            unreadable.add(doc_path.stem)
+            findings.append(Finding(
+                "dataset_metadata_invalid", "error", doc_id,
+                f"dataset metadata {', '.join(missing)} missing or unusable; "
+                "feed the original file again with `akasha feed add`"))
+            continue
         name = str(meta["dataset"])
-        copy = Path(str(meta.get("file") or ""))
-        recorded = str(meta.get("sha256") or "")
-        named.add(copy.resolve())
-        if not copy.is_file():
+        copy = Path(str(meta["file"]))
+        recorded = str(meta["sha256"])
+        if not copy.is_file():    # `named` already holds it, so it is not an orphan
             findings.append(Finding(
                 "dataset_copy_missing", "error", doc_id,
                 "copy missing; feed the original file again with `akasha feed add`"))
@@ -241,13 +276,13 @@ def _datasets(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:
                 "dataset_copy_mismatch", "error", doc_id,
                 f"copy is {actual[:12]}, the document says {recorded[:12]}; "
                 "feed the original file again"))
-        expected = feed.unit_state(recorded, str(meta.get("settings_sha256") or ""), cfg)
+        expected = feed.unit_state(recorded, str(meta["settings_sha256"]), cfg)
         if feed_store.stored_state(conn, name) != expected:
             findings.append(Finding(
                 "dataset_units_stale", "warning", doc_id,
                 f"the units of '{name}' are not the ones this copy gives; "
                 "run `akasha index --force`"))
-    return findings + _leftovers(cfg, named)
+    return findings + _leftovers(cfg, named, unreadable)
 
 
 def check(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:

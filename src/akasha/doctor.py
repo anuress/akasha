@@ -218,7 +218,8 @@ def _failures(conn: sqlite3.Connection) -> list[Finding]:
                     f"{failed} tool failure(s) in 7 days; `akasha knowledge stats`")]
 
 
-def _dataset_attach(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:
+def _dataset_attach(conn: sqlite3.Connection, cfg: Config,
+                    datasets: list[tuple[str, dict]]) -> list[Finding]:
     """The last attach failure of each dataset whose units are still not its own.
 
     A successful attach stores the state the document asks for, so an event is history once
@@ -238,7 +239,7 @@ def _dataset_attach(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:
         if name and name not in latest:
             latest[name] = str(payload.get("error") or "")
     findings: list[Finding] = []
-    for _doc_id, meta in dataset_documents(conn):
+    for _doc_id, meta in datasets:
         name = str(meta["dataset"])
         if name not in latest:
             continue
@@ -250,10 +251,10 @@ def _dataset_attach(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:
     return findings
 
 
-def _xlsx(conn: sqlite3.Connection) -> list[Finding]:
+def _xlsx(datasets: list[tuple[str, dict]]) -> list[Finding]:
     """Name the extra only while a dataset needs it; otherwise its absence is not news."""
     if not any(str(meta.get("file") or "").lower().endswith(".xlsx")
-               for _doc_id, meta in dataset_documents(conn)):
+               for _doc_id, meta in datasets):
         return []
     try:
         import openpyxl  # noqa: F401
@@ -262,6 +263,12 @@ def _xlsx(conn: sqlite3.Connection) -> list[Finding]:
                         "an xlsx dataset cannot be split again, extra not installed; "
                         "uv tool install 'akasha-mcp[xlsx]'")]
     return []
+
+
+def _datasets(cfg: Config, conn: sqlite3.Connection) -> list[Finding]:
+    """Both dataset checks over one read: parsing every dataset document is the cost."""
+    datasets = dataset_documents(conn)
+    return _xlsx(datasets) + _dataset_attach(conn, cfg, datasets)
 
 
 def _isolated(kind: str, run) -> list[Finding]:
@@ -283,8 +290,7 @@ def check(cfg: Config, conn: sqlite3.Connection, home: Path | None = None,
         ("config", lambda: _config(config_path)),
         ("index_root", lambda: _sources(cfg, conn)),
         ("knowledge", lambda: _knowledge(conn)),
-        ("xlsx", lambda: _xlsx(conn)),
-        ("dataset_attach", lambda: _dataset_attach(conn, cfg)),
+        ("datasets", lambda: _datasets(cfg, conn)),
         ("custom_kinds", lambda: _custom_kinds(cfg)),
         ("conventions", lambda: _conventions(conn)),
         ("vectors", lambda: [_vectors(cfg, conn)]),

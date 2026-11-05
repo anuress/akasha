@@ -712,3 +712,64 @@ def test_trash_and_locks_are_not_orphans(env, tmp_path):
     (files / ".trash" / "sample-repo" / "old.csv").write_text("item\n", encoding="utf-8")
 
     assert _dataset_findings(conn, cfg) == []
+
+
+def test_dataset_doc_with_bad_frontmatter_is_reported(env, tmp_path):
+    """A damaged document must not vanish from every check while its cells still answer."""
+    conn, cfg = env
+    result = _dataset(env, tmp_path)
+    doc = _dataset_doc(cfg)
+    doc.write_text("".join(line for line in doc.read_text().splitlines(keepends=True)
+                           if not line.startswith("sha256:")))
+
+    findings = [f for f in _dataset_findings(conn, cfg) if f.kind == "dataset_metadata_invalid"]
+
+    assert len(findings) == 1
+    assert findings[0].severity == "error"
+    assert findings[0].document_id == result.doc_id
+    assert findings[0].detail == (
+        "dataset metadata sha256 missing or unusable; "
+        "feed the original file again with `akasha feed add`")
+    assert doc.is_file(), "fsck reports a damaged document, it never deletes one"
+    assert conn.execute("SELECT COUNT(*) c FROM chunks WHERE document_id = ?",
+                        (result.doc_id,)).fetchone()["c"] > 0
+
+
+def test_copy_of_unreadable_dataset_doc_is_not_called_orphan(env, tmp_path):
+    """The re-feed needs that copy, so the document is the finding, never the file."""
+    conn, cfg = env
+    result = _dataset(env, tmp_path)
+    _dataset_doc(cfg).write_text("## no frontmatter at all\ncells still answer\n")
+
+    findings = _dataset_findings(conn, cfg)
+
+    assert [f.kind for f in findings] == ["dataset_metadata_invalid"]
+    assert findings[0].document_id == result.doc_id
+    assert "dataset, file, sha256, settings_sha256" in findings[0].detail
+    assert result.copy.is_file()
+
+
+def test_the_named_copy_of_a_broken_document_is_not_an_orphan(env, tmp_path):
+    """One bad key still leaves `file` readable, and that copy is the one to re-feed."""
+    conn, cfg = env
+    _dataset(env, tmp_path)
+    doc = _dataset_doc(cfg)
+    doc.write_text("".join(line for line in doc.read_text().splitlines(keepends=True)
+                           if not line.startswith("settings_sha256:")))
+
+    kinds = [f.kind for f in _dataset_findings(conn, cfg)]
+
+    assert kinds == ["dataset_metadata_invalid"]
+
+
+def test_an_orphan_is_described_as_unclaimed(env, tmp_path):
+    """Nothing here knows who owns an orphan, so no advice calls it safe to delete."""
+    conn, cfg = env
+    _dataset(env, tmp_path)
+    stray = cfg.knowledge_dir.parent / "files" / "sample-repo" / "notes.csv"
+    stray.write_text("a\n1\n", encoding="utf-8")
+
+    orphans = [f for f in _dataset_findings(conn, cfg) if f.kind == "dataset_copy_orphan"]
+
+    assert len(orphans) == 1
+    assert orphans[0].detail == f"{stray} is named by no readable dataset document"
