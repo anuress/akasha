@@ -5,10 +5,11 @@ cell, so the suite needs no real export and no real knowledge base.
 """
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import os
+import sys
 import threading
+from importlib import reload
 
 import pytest
 
@@ -218,6 +219,7 @@ def test_refeed_with_missing_key_column_changes_nothing(env, source):
     copy_before = _copy(cfg).read_bytes()
     units_before = feed_store.load_units(conn, "prices")
     state_before = feed_store.stored_state(conn, "prices")
+    doc_mtime = os.stat(_doc(cfg)).st_mtime
 
     with pytest.raises(ValueError, match="unknown column 'item'"):
         feed.feed(conn, cfg, source(rows="sku,price\nbolt,4\n"), "prices", None,
@@ -227,6 +229,7 @@ def test_refeed_with_missing_key_column_changes_nothing(env, source):
     assert _doc(cfg).read_text() == doc_before
     assert feed_store.load_units(conn, "prices") == units_before
     assert feed_store.stored_state(conn, "prices") == state_before
+    assert os.stat(_doc(cfg)).st_mtime == doc_mtime
 
 
 def test_failure_inside_transaction_rolls_back_and_restores_copy_and_doc(
@@ -594,9 +597,59 @@ def test_second_feed_of_same_name_waits_for_lock(env, source, tmp_path):
         assert started.wait(5) is True        # the worker reached the feed call
         assert done.wait(0.3) is False        # blocked on the lock this test holds
     finally:
-        fcntl.flock(hold.fileno(), fcntl.LOCK_UN)
-        hold.close()
+        feed._unlock(hold)
     assert done.wait(10) is True
     thread.join()
     assert isinstance(outcome[0], feed.FeedResult)
     assert outcome[0].units == 2
+
+
+def test_feed_module_imports_without_fcntl(monkeypatch):
+    """akasha runs on Windows, where there is no `fcntl` and `index_all` imports this
+    module, so the lock is imported inside `_lock` rather than at load time."""
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+    try:
+        reload(feed)
+    finally:
+        monkeypatch.undo()
+        reload(feed)
+
+    assert callable(feed.feed) and callable(feed._unlock)
+
+
+@pytest.mark.parametrize("repo", [".locks", ".trash", ".Locks", ".TRASH"])
+def test_reserved_repo_names_are_refused(env, source, repo):
+    """`files/.locks` and `files/.trash` are akasha own, so a repo of that name would put
+    a dataset copy where the lock files and the trash live."""
+    conn, cfg = env
+
+    with pytest.raises(ValueError, match="invalid repo"):
+        feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo=repo)
+
+    assert not (cfg.knowledge_dir / repo).exists()
+    assert feed_store.load_units(conn, "prices") == []
+
+
+def test_failed_restore_continues_and_reraises_original(env, source, monkeypatch):
+    """A cleanup step that fails must not replace the error the caller can act on: the
+    failure is noted on the original exception and the other restores still run."""
+    conn, cfg = env
+    settings = FeedSettings(key="item")
+    feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
+    doc_before = _doc(cfg).read_text()
+    real_replace = os.replace
+
+    def flaky_replace(src, dst):
+        if str(src).endswith(".bak"):
+            raise OSError("backup is gone")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(feed.os, "replace", flaky_replace)
+    monkeypatch.setattr(knowledge, "_reindex", _boom)
+    with pytest.raises(RuntimeError, match="reindex exploded") as raised:
+        feed.feed(conn, cfg, source(rows="item,price\nbolt,9\n"), "prices", settings,
+                  repo="sample-repo")
+
+    assert any("backup is gone" in note for note in raised.value.__notes__)
+    assert not list((cfg.knowledge_dir.parent / "files").rglob("*.staging*"))
+    assert _doc(cfg).read_text() == doc_before

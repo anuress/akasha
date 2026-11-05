@@ -11,7 +11,6 @@ entirely or leaves the previous feed untouched.
 """
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -42,6 +41,10 @@ __all__ = [
 ]
 
 ALLOWED_SUFFIXES = (".csv", ".xlsx")
+
+# Directories akasha owns inside `files/`: a repo of that name would put a dataset where
+# the lock files and the trash live.
+RESERVED_REPOS = frozenset({".locks", ".trash"})
 
 # Above this the feed still happens: the warning says what it will cost.
 LARGE_FILE_BYTES = 50 * 1024 * 1024
@@ -246,8 +249,28 @@ def _lock(cfg: Config, name: str) -> IO[str]:
     path = cfg.knowledge_dir.parent / "files" / ".locks" / f"{name}.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+")
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    try:
+        import fcntl
+    except ImportError:                     # Windows
+        import msvcrt
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
     return handle
+
+
+def _unlock(handle: IO[str]) -> None:
+    """Release a lock taken by `_lock`, through the mechanism that took it."""
+    try:
+        import fcntl
+    except ImportError:                     # Windows
+        import msvcrt
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
 
 
 def _dataset_doc(cfg: Config, name: str) -> Path | None:
@@ -267,6 +290,7 @@ def _repo_name(cfg: Config, repo: str) -> str:
     `knowledge.write`: a plain name, and a folder that stays inside the knowledge dir."""
     folder = cfg.knowledge_dir / repo
     if (not knowledge._REPO_NAME.fullmatch(repo) or repo in (".", "..")
+            or repo.casefold() in RESERVED_REPOS
             or not folder.resolve().is_relative_to(cfg.knowledge_dir.resolve())):
         raise ValueError(
             f"invalid repo {repo!r}: use a plain name of letters, digits, '.', '_' and '-'")
@@ -381,8 +405,7 @@ def feed(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
     try:
         return _feed_locked(conn, cfg, path, name, settings, repo)
     finally:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
+        _unlock(handle)
 
 
 def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
@@ -436,6 +459,7 @@ def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
     backups: list[tuple[Path, Path]] = []
     failures_before = len(ATTACH_ERRORS)
     swapped = False
+    doc_written = False
     try:
         staging.parent.mkdir(parents=True, exist_ok=True)
         # One snapshot: the hash above, the split below and the copy that is installed all
@@ -469,6 +493,7 @@ def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
         conn.execute("BEGIN IMMEDIATE")
         feed_store.replace_units(conn, name, units, state)
         doc_path.parent.mkdir(parents=True, exist_ok=True)
+        doc_written = True
         doc_path.write_text(text)
         knowledge._reindex(conn, cfg, doc_path, commit=False)
         failures = [message for dataset, message in ATTACH_ERRORS[failures_before:]
@@ -478,20 +503,40 @@ def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
             # units it just stored are not what got attached, so it is a failed write.
             raise ValueError(failures[0])
         conn.execute("COMMIT")
-    except Exception:
+    except Exception as exc:
+        cleanup: list[str] = []
         if conn.in_transaction:
             conn.execute("ROLLBACK")
         # A backup restores its own name, so unlinking the new copy is right unless one of
         # them is that name: a feed that changed the extension renamed the old copy away.
         if swapped and all(original != copy for _backup, original in backups):
-            copy.unlink(missing_ok=True)
+            try:
+                copy.unlink(missing_ok=True)
+            except OSError as failure:
+                cleanup.append(f"could not remove {copy}: {failure}")
         for backup, original in backups:
-            os.replace(backup, original)
-        staging.unlink(missing_ok=True)
-        if previous_text is None:
-            doc_path.unlink(missing_ok=True)
-        else:
-            doc_path.write_text(previous_text)
+            try:
+                os.replace(backup, original)
+            except OSError as failure:
+                cleanup.append(f"could not restore {original}: {failure}")
+        try:
+            staging.unlink(missing_ok=True)
+        except OSError as failure:
+            cleanup.append(f"could not remove {staging}: {failure}")
+        # Only a document this call wrote is restored: rewriting one that was never touched
+        # moves its mtime, and the next index run then re-reads and re-attaches it.
+        if doc_written:
+            try:
+                if previous_text is None:
+                    doc_path.unlink(missing_ok=True)
+                else:
+                    doc_path.write_text(previous_text)
+            except OSError as failure:
+                cleanup.append(f"could not restore {doc_path}: {failure}")
+        # The reason the feed failed is what the caller can act on; a cleanup that failed
+        # too is attached to it rather than replacing it.
+        for note in cleanup:
+            exc.add_note(note)
         raise
 
     for backup, original in backups:
