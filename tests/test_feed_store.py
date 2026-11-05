@@ -119,6 +119,27 @@ def test_diff_reports_changed_fields_label_and_capped_lines():
         "mode: +x", "note: -line two", "note: +line TWO", "size: -10"]
 
 
+def test_diff_keeps_content_lines_starting_with_dashes_or_pluses():
+    """The `---`/`+++` header filter must not eat a cell whose own lines start with
+    `--`/`++`: `-` plus `-- note` reads as a header line, and a dropped line is exactly
+    what the diff exists to show."""
+    result = feed_store.diff(
+        [_unit("row:2", note="-- note\na")], [_unit("row:2", note="++ x\na")])
+
+    assert result.changed[0].lines == ["note: --- note", "note: +++ x"]
+
+
+def test_diff_label_only_change_is_reported():
+    """A relabelled row changed the text the caller's search shows even though no cell
+    moved, so it must be a change with no field lines rather than no change at all."""
+    result = feed_store.diff(
+        [_unit("row:2", label="Werk")], [_unit("row:2", label="Werk (7)")])
+
+    assert not result.added and not result.removed
+    assert [(change.identity, change.label, change.fields, change.lines)
+            for change in result.changed] == [("row:2", "Werk (7)", [], [])]
+
+
 def test_unit_chunk_id_changes_only_with_value():
     """The id is what carries a stored vector across a re-import, so it must depend on
     the cell's identity and value and on nothing else."""
