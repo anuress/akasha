@@ -701,6 +701,8 @@ def test_index_path_leaves_the_callers_transaction_open_on_injection(env):
     conn.execute("BEGIN IMMEDIATE")
     index_path(conn, cfg, doc, "notes", root=root, commit_events=False)
     assert conn.in_transaction, "the injection event must not commit the caller's transaction"
+    assert conn.execute("SELECT count(*) FROM documents").fetchone()[0] == 1
+    assert conn.execute("SELECT kind FROM events").fetchone()["kind"] == "security.injection"
     conn.execute("ROLLBACK")
 
     assert conn.execute("SELECT count(*) FROM documents").fetchone()[0] == 0

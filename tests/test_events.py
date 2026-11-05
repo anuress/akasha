@@ -59,5 +59,7 @@ def test_emit_joins_a_callers_transaction_when_commit_is_false(conn):
     conn.execute("BEGIN IMMEDIATE")
     emit(conn, "knowledge.written", document="doc-1", commit=False)
     assert conn.in_transaction, "emit must not commit the caller's transaction"
+    assert [r["kind"] for r in recent(conn)] == ["knowledge.written"], \
+        "the event must be inside the transaction, or a no-op would pass as well"
     conn.execute("ROLLBACK")
     assert recent(conn) == []

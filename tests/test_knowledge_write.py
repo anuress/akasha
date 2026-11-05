@@ -241,6 +241,7 @@ def test_reindex_joins_a_callers_transaction_when_commit_is_false(env):
     conn.execute("BEGIN IMMEDIATE")
     _reindex(conn, cfg, path, commit=False)
     assert conn.in_transaction, "_reindex must not commit the caller's transaction"
+    assert any("after-edit" in r["body"] for r in conn.execute(query, (doc_id,)))
     conn.execute("ROLLBACK")
 
     assert [dict(r) for r in conn.execute(query, (doc_id,))] == before
