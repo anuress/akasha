@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
+import sqlite3
 import sys
 import threading
+import types
 from importlib import reload
 
 import pytest
@@ -17,6 +20,7 @@ from akasha import feed, feed_store, knowledge
 from akasha.config import load_config
 from akasha.db import connect
 from akasha.markdown import parse_frontmatter
+from akasha.search import search
 from akasha.splitters import FeedSettings
 
 ROWS = "item,price\nbolt,4\nnut,2\n"
@@ -653,3 +657,196 @@ def test_failed_restore_continues_and_reraises_original(env, source, monkeypatch
     assert any("backup is gone" in note for note in raised.value.__notes__)
     assert not list((cfg.knowledge_dir.parent / "files").rglob("*.staging*"))
     assert _doc(cfg).read_text() == doc_before
+
+
+def _doc_id(conn, cfg, name="prices", repo="sample-repo"):
+    return conn.execute("SELECT id FROM documents WHERE path = ?",
+                        (str(_doc(cfg, name, repo)),)).fetchone()["id"]
+
+
+def test_remove_dataset_trashes_doc_and_copy_and_drops_units(env, source):
+    """Removing a dataset has to take all three things that make it: its document, its
+    copy, and the unit rows search would otherwise keep answering from."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    copy_bytes = _copy(cfg).read_bytes()
+    doc_text = _doc(cfg).read_text()
+
+    doc_trash, copy_trash = feed.remove_dataset(conn, cfg, "prices")
+
+    assert not _doc(cfg).exists()
+    assert not _copy(cfg).exists()
+    assert doc_trash.parent == cfg.knowledge_dir.parent / "trash"
+    assert doc_trash.read_text() == doc_text
+    assert copy_trash.parent == cfg.knowledge_dir.parent / "files" / ".trash" / "sample-repo"
+    assert re.fullmatch(r"prices-\d{8}T\d{6}\.csv", copy_trash.name)
+    assert copy_trash.read_bytes() == copy_bytes
+    assert feed_store.load_units(conn, "prices") == []
+    assert feed_store.stored_state(conn, "prices") is None
+    assert conn.execute("SELECT COUNT(*) c FROM feed_chunks WHERE dataset = 'prices'"
+                        ).fetchone()["c"] == 0
+    assert not search(conn, "bolt", all_repos=True, include_archived=True)
+
+
+def test_remove_unknown_dataset_is_keyerror(env):
+    """The name is global, so an unknown one has to say so rather than trash whatever
+    happens to sit at the path a guess would build."""
+    conn, cfg = env
+
+    with pytest.raises(KeyError, match="no dataset 'ghost'"):
+        feed.remove_dataset(conn, cfg, "ghost")
+
+
+def test_remove_dataset_restores_the_copy_when_the_db_part_fails(env, source, monkeypatch):
+    """The copy leaves before the transaction, so a failure there must put it back: a live
+    document whose copy sits in the trash can neither be fed again nor restored."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    copy_bytes = _copy(cfg).read_bytes()
+
+    def boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(feed_store, "drop_dataset", boom)
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        feed.remove_dataset(conn, cfg, "prices")
+
+    assert _copy(cfg).read_bytes() == copy_bytes
+    assert _doc(cfg).is_file()
+    assert conn.in_transaction is False
+
+
+def test_restore_dataset_brings_copy_back_and_reattaches_units(env, source):
+    """A dataset's cells are split from its copy, so a restore that left the copy in the
+    trash would bring back a document whose cells nothing can produce."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    copy_bytes = _copy(cfg).read_bytes()
+    doc_id = _doc_id(conn, cfg)
+    feed.remove_dataset(conn, cfg, "prices")
+    assert not search(conn, "bolt", all_repos=True, include_archived=True)
+
+    path = knowledge.restore(conn, cfg, doc_id)
+
+    assert path == _doc(cfg)
+    assert _copy(cfg).read_bytes() == copy_bytes
+    assert len(feed_store.load_units(conn, "prices")) == 2
+    assert len(_unit_chunks(conn, doc_id)) == 4          # two rows of two fields
+    assert search(conn, "bolt", all_repos=True)
+
+
+def test_restore_dataset_with_purged_copy_refuses_and_changes_nothing(env, source):
+    """Without its copy the restored document would claim units it cannot produce, so the
+    refusal comes before the document leaves the trash."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    doc_id = _doc_id(conn, cfg)
+    doc_trash, copy_trash = feed.remove_dataset(conn, cfg, "prices")
+    copy_trash.unlink()
+    trashed_text = doc_trash.read_text()
+
+    with pytest.raises(ValueError, match="copy purged"):
+        knowledge.restore(conn, cfg, doc_id)
+
+    assert doc_trash.read_text() == trashed_text
+    assert not _doc(cfg).exists()
+    row = conn.execute("SELECT path, deleted_at FROM documents WHERE id = ?",
+                       (doc_id,)).fetchone()
+    assert row["deleted_at"] and row["path"] == str(doc_trash)
+
+
+def test_purge_deletes_trashed_copies_inside_trash_only(env, source):
+    """A copy is not a document row, so nothing else would ever clear one out of
+    `files/.trash`; `purge` owns it, by the same rules as the documents: the cutoff, and
+    never outside the trash."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    _doc_trash, copy_trash = feed.remove_dataset(conn, cfg, "prices")
+
+    outside = cfg.knowledge_dir.parent / "files" / "sample-repo" / "keep.csv"
+    outside.write_text("item,price\nbolt,4\n", encoding="utf-8")
+    through = copy_trash.parent / "through.csv"
+    os.symlink(outside, through)
+
+    assert knowledge.purge(conn, cfg, older_than_days=1) == 0     # trashed a moment ago
+
+    assert knowledge.purge(conn, cfg) == 2                        # one document, one copy
+    assert not copy_trash.exists()
+    assert outside.exists()
+    assert outside.read_text(encoding="utf-8").startswith("item,price")
+    assert through.is_symlink()
+
+
+def test_refeed_after_remove_starts_fresh(env, source):
+    """A removed dataset has no units and no document left, so the next feed is a first
+    feed: it must not diff against what the removed dataset used to hold."""
+    conn, cfg = env
+    settings = FeedSettings(key="item")
+    feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
+    feed.remove_dataset(conn, cfg, "prices")
+
+    result = feed.feed(conn, cfg, source(rows="item,price\nbolt,4\n"), "prices", settings,
+                       repo="sample-repo")
+
+    assert result.diff is None
+    assert result.unchanged is False
+    assert result.units == 1
+    _meta, body = parse_frontmatter(_doc(cfg).read_text())
+    assert "first feed: 1 units" in body
+
+
+def test_windows_lock_retries_until_acquired(env, monkeypatch):
+    """`msvcrt.locking(LK_LOCK)` gives up after about ten seconds where `flock` blocks, so
+    on Windows a second feed of one name would fail instead of waiting for the first."""
+    _conn, cfg = env
+    modes: list[int] = []
+    fake = types.SimpleNamespace(LK_LOCK=2, LK_NBLCK=3, LK_UNLCK=0)
+
+    def locking(_fd, mode, _size):
+        modes.append(mode)
+        if mode == fake.LK_LOCK and modes.count(fake.LK_LOCK) < 3:
+            raise OSError("locking failed: another process holds the file")
+
+    fake.locking = locking
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+
+    handle = feed._lock(cfg, "prices")
+    assert modes.count(fake.LK_LOCK) == 3      # refused twice, then taken
+    feed._unlock(handle)
+    assert modes[-1] == fake.LK_UNLCK
+
+
+class _NoRollback:
+    """A connection whose ROLLBACK fails, so the rollback is the step under test."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def execute(self, sql, *parameters):
+        if sql.lstrip().upper().startswith("ROLLBACK"):
+            raise sqlite3.OperationalError("cannot rollback - no transaction is active")
+        return self._conn.execute(sql, *parameters)
+
+
+def test_rollback_failure_still_restores_files_and_raises_original(env, source, monkeypatch):
+    """The rollback is a cleanup step like the file restores: one that fails must not stop
+    them, and must not replace the reason the feed failed."""
+    conn, cfg = env
+    settings = FeedSettings(key="item")
+    feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
+    doc_before = _doc(cfg).read_text()
+    copy_before = _copy(cfg).read_bytes()
+
+    monkeypatch.setattr(knowledge, "_reindex", _boom)
+    with pytest.raises(RuntimeError, match="reindex exploded") as raised:
+        feed.feed(_NoRollback(conn), cfg, source(rows="item,price\nbolt,9\n"), "prices",
+                  settings, repo="sample-repo")
+
+    assert any("roll back" in note for note in raised.value.__notes__)
+    assert _doc(cfg).read_text() == doc_before
+    assert _copy(cfg).read_bytes() == copy_before
+    assert not list((cfg.knowledge_dir.parent / "files").rglob("*.staging*"))

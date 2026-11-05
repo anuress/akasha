@@ -39,6 +39,8 @@ __all__ = [
     "get_unit",
     "query_units",
     "redact_units",
+    "remove_dataset",
+    "trashed_copies",
     "unit_state",
 ]
 
@@ -241,6 +243,28 @@ def _staging_path(cfg: Config, repo: str, name: str, suffix: str) -> Path:
     return cfg.knowledge_dir.parent / "files" / repo / f"{name}.staging{suffix}"
 
 
+def _trash_path(cfg: Config, repo: str, name: str, suffix: str) -> Path:
+    """Where a copy goes when it leaves the dataset, under the repo it belonged to.
+
+    Stamped with the moment it was trashed: the stamp orders two copies of one name, and
+    `purge` ages a copy by it, since the file itself keeps the mtime of the export it was.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    return cfg.knowledge_dir.parent / "files" / ".trash" / repo / f"{name}-{stamp}{suffix}"
+
+
+def trashed_copies(cfg: Config, repo: str, name: str) -> list[Path]:
+    """The trashed copies of one dataset, oldest first.
+
+    The stamp in the name is what orders them, so the last one is the newest and is what a
+    restore puts back.
+    """
+    folder = cfg.knowledge_dir.parent / "files" / ".trash" / repo
+    found = [path for suffix in ALLOWED_SUFFIXES
+             for path in folder.glob(f"{name}-*{suffix}") if path.is_file()]
+    return sorted(found, key=lambda path: path.name)
+
+
 def _lock(cfg: Config, name: str) -> IO[str]:
     """One feed of a name at a time.
 
@@ -256,7 +280,14 @@ def _lock(cfg: Config, name: str) -> IO[str]:
     except ImportError:                     # Windows
         import msvcrt
         handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        # `LK_LOCK` gives up after about ten seconds where `flock` blocks until it has the
+        # lock, so the retry is what makes both platforms wait instead of fail.
+        while True:
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                break
+            except OSError:
+                continue
     else:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
     return handle
@@ -494,6 +525,7 @@ def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
         swapped = True
         conn.execute("BEGIN IMMEDIATE")
         feed_store.replace_units(conn, name, units, state)
+        _drop_removed_copy(conn, cfg, name)
         doc_path.parent.mkdir(parents=True, exist_ok=True)
         doc_written = True
         doc_path.write_text(text)
@@ -508,7 +540,10 @@ def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
     except Exception as exc:
         cleanup: list[str] = []
         if conn.in_transaction:
-            conn.execute("ROLLBACK")
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error as failure:
+                cleanup.append(f"could not roll back: {failure}")
         # A backup restores its own name, so unlinking the new copy is right unless one of
         # them is that name: a feed that changed the extension renamed the old copy away.
         if swapped and all(original != copy for _backup, original in backups):
@@ -546,9 +581,7 @@ def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
             if original == copy:
                 backup.unlink(missing_ok=True)
             else:
-                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-                trashed = (cfg.knowledge_dir.parent / "files" / ".trash" / resolved_repo
-                           / f"{name}-{stamp}{original.suffix}")
+                trashed = _trash_path(cfg, resolved_repo, name, original.suffix)
                 trashed.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(backup, trashed)
         except OSError as exc:
@@ -648,3 +681,70 @@ def query_units(conn: sqlite3.Connection, name: str, where: list[str] | tuple = 
         if len(found) == limit:
             break
     return found
+
+
+def remove_dataset(conn: sqlite3.Connection, cfg: Config, name: str) -> tuple[Path, Path]:
+    """Take a dataset out of the knowledge base, keeping its document and copy in trash.
+
+    Returns where each went. The copy leaves first, so a failure before the database part
+    can put it straight back; the unit rows, the cell mapping and the document's tombstone
+    then land in one transaction. `knowledge.restore` and `feed` are what put a name back.
+    """
+    handle = _lock(cfg, name)
+    try:
+        doc = _dataset_doc(cfg, name)
+        row = None if doc is None else conn.execute(
+            "SELECT id FROM documents WHERE path = ?", (str(doc),)).fetchone()
+        if row is None:
+            raise KeyError(f"no dataset '{name}'")
+        repo = doc.parent.parent.name
+        moved: list[tuple[Path, Path]] = []
+        for suffix in ALLOWED_SUFFIXES:
+            old = _copy_path(cfg, repo, name, suffix)
+            if not old.exists():
+                continue
+            trashed = _trash_path(cfg, repo, name, suffix)
+            trashed.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(old, trashed)
+            moved.append((trashed, old))
+        # A copy deleted behind akasha's back is what fsck reports as `missing_copy`, and
+        # this is the command that clears it, so a missing copy must not crash either.
+        copy_trash = moved[-1][0] if moved else _trash_path(cfg, repo, name,
+                                                            ALLOWED_SUFFIXES[0])
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            feed_store.drop_dataset(conn, name)
+            doc_trash = knowledge._remove_unchecked(conn, cfg, row["id"])
+            conn.execute("COMMIT")
+        except Exception as exc:                                     # noqa: BLE001
+            if conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error as failure:
+                    exc.add_note(f"could not roll back: {failure}")
+            for trashed, old in moved:
+                os.replace(trashed, old)
+            raise
+        return doc_trash, copy_trash
+    finally:
+        _unlock(handle)
+
+
+def _drop_removed_copy(conn: sqlite3.Connection, cfg: Config, name: str) -> None:
+    """Forget the tombstone a removed dataset of this name left behind.
+
+    `index_path` derives a document id from its path, and a tombstone still holds the id
+    of the path this feed is about to create again, so leaving it in place collides with
+    its own trash. It would also let an older dataset of the same name be restored over
+    the copy this feed installs. The trashed document file stays on disk.
+    """
+    trash = cfg.knowledge_dir.parent / "trash"
+    for row in conn.execute(
+            "SELECT id, path FROM documents WHERE deleted_at IS NOT NULL").fetchall():
+        if (Path(row["path"]).parent != trash
+                or Path(row["path"]).name != f"{row['id']}__{name}.md"):
+            continue
+        conn.execute("DELETE FROM chunks WHERE document_id = ?", (row["id"],))
+        conn.execute("DELETE FROM links WHERE from_document_id = ? OR to_document_id = ?",
+                     (row["id"], row["id"]))
+        conn.execute("DELETE FROM documents WHERE id = ?", (row["id"],))
