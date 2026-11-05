@@ -41,6 +41,8 @@ class Hit:
     # Resolved links in either direction, so the caller knows when a follow-up
     # knowledge_related hop would pay. Zero says the document sits alone in the graph.
     neighbours: int = 0
+    # The dataset row this chunk is a cell of, with the exact next call; None on prose.
+    unit: dict | None = None
 
     def as_dict(self, withheld_chars: int = 0) -> dict:
         """The shape a caller receives: default-valued fields are omitted, and so is
@@ -52,10 +54,24 @@ class Hit:
         for name, value in (("repo", self.repo), ("feature", self.feature), ("relaxed", self.relaxed),
                             ("cross_repo", self.cross_repo),
                             ("withheld_chars", withheld_chars),
-                            ("neighbours", self.neighbours)):
+                            ("neighbours", self.neighbours), ("unit", self.unit)):
             if value:
                 out[name] = value
         return out
+
+
+def _unit_info(dataset: str | None, locator: str | None, key: str | None,
+               field: str | None) -> dict | None:
+    """The dataset row a chunk is a cell of, plus the exact call that reads the whole row.
+
+    A hit on one cell says nothing about the row around it, and a caller that has to
+    guess the follow-up call spends a turn on the guess.
+    """
+    if dataset is None:
+        return None
+    identity = f"key:{key}" if key else locator
+    return {"dataset": dataset, "locator": locator, "key": key, "field": field,
+            "next": f'knowledge_feed_get(name="{dataset}", locator="{identity}")'}
 
 
 def _escape(q: str, mode: str = "all") -> str:
@@ -85,11 +101,17 @@ def _run(
       SELECT c.id, c.document_id, c.heading, c.body,
              d.path, d.repo, d.status, d.updated_at,
              f.slug AS feature_slug,
+             fc.dataset AS unit_dataset, fc.locator AS unit_locator,
+             fc.field AS unit_field, fu.key AS unit_key,
              bm25(chunks_fts, 20.0, 10.0, 1.0) AS raw
       FROM chunks_fts
       JOIN chunks c ON c.rowid = chunks_fts.rowid
       JOIN documents d ON d.id = c.document_id
       LEFT JOIN features f ON f.id = d.feature_id
+      -- A cell chunk names its whole row through feed_chunks and feed_units; a prose
+      -- chunk gets NULL here and carries no unit.
+      LEFT JOIN feed_chunks fc ON fc.chunk_id = c.id
+      LEFT JOIN feed_units fu ON fu.dataset = fc.dataset AND fu.locator = fc.locator
       WHERE chunks_fts MATCH ? AND d.deleted_at IS NULL
     """
     params: list = [match_expr]
@@ -138,6 +160,8 @@ def _run(
             id=r["id"], document_id=r["document_id"], score=score,
             repo=r["repo"], feature=r["feature_slug"], path=r["path"],
             heading=r["heading"] or "", text=r["body"], relaxed=relaxed,
+            unit=_unit_info(r["unit_dataset"], r["unit_locator"], r["unit_key"],
+                            r["unit_field"]),
         ))
     hits.sort(key=lambda h: h.score, reverse=True)
     # One chunk per document: a limit of 5 should surface five documents, not five
@@ -429,9 +453,14 @@ def _hit_for_chunk(conn, chunk_id: str, include_archived: bool = False,
     """
     row = conn.execute(
         "SELECT c.id, c.document_id, c.heading, c.body, d.path, d.repo, d.status,"
-        " d.invalid_at, f.slug AS feature_slug FROM chunks c"
+        " d.invalid_at, f.slug AS feature_slug,"
+        " fc.dataset AS unit_dataset, fc.locator AS unit_locator,"
+        " fc.field AS unit_field, fu.key AS unit_key"
+        " FROM chunks c"
         " JOIN documents d ON d.id = c.document_id"
         " LEFT JOIN features f ON f.id = d.feature_id"
+        " LEFT JOIN feed_chunks fc ON fc.chunk_id = c.id"
+        " LEFT JOIN feed_units fu ON fu.dataset = fc.dataset AND fu.locator = fc.locator"
         " WHERE c.id = ? AND d.deleted_at IS NULL", (chunk_id,)).fetchone()
     if row is None:
         return None
@@ -446,7 +475,9 @@ def _hit_for_chunk(conn, chunk_id: str, include_archived: bool = False,
             return None
     return Hit(id=row["id"], document_id=row["document_id"], score=0.0,
                repo=row["repo"], feature=row["feature_slug"], path=row["path"],
-               heading=row["heading"] or "", text=row["body"])
+               heading=row["heading"] or "", text=row["body"],
+               unit=_unit_info(row["unit_dataset"], row["unit_locator"], row["unit_key"],
+                               row["unit_field"]))
 
 
 def rrf_merge(lists: list[list[str]], k: int = 60) -> list[str]:

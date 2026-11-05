@@ -499,3 +499,67 @@ def test_lexical_hits_keep_a_visible_score_on_a_small_corpus(tmp_path):
     hits = search(conn, "cache", cfg=cfg)
     assert hits and hits[0].score > 0
     assert hits[0].as_dict()["score"] > 0
+
+
+@pytest.fixture
+def fed(env, tmp_path):
+    """A dataset cell, stored by the same write path `akasha feed` uses, so search sees
+    exactly the chunk a fed row produces. Returns the chunk id of one cell."""
+    from akasha import feed
+    from akasha.splitters import FeedSettings
+
+    conn, cfg = env
+    path = tmp_path / "prices.csv"
+    path.write_text("item,price\nquorum-bolt,4\n", encoding="utf-8")
+    feed.feed(conn, cfg, path, "prices", FeedSettings(key="item"), repo="sample-repo")
+    cell = conn.execute(
+        "SELECT chunk_id FROM feed_chunks WHERE dataset = 'prices'"
+        " AND locator = 'row:2' AND field = 'price'").fetchone()["chunk_id"]
+    return conn, cfg, cell
+
+
+def test_search_hit_on_unit_chunk_carries_unit_and_next(fed):
+    """A hit on a cell is useless on its own: the unit says which dataset and which row
+    it belongs to, and `next` is the exact call that reads the whole row."""
+    conn, cfg, _cell = fed
+
+    hits = search(conn, "quorum-bolt", all_repos=True)
+
+    assert hits, "the fed cell must be searchable by its value"
+    unit = hits[0].unit
+    assert (unit["dataset"], unit["locator"], unit["key"]) == (
+        "prices", "row:2", "quorum-bolt")
+    stored = conn.execute("SELECT field FROM feed_chunks WHERE chunk_id = ?",
+                          (hits[0].id,)).fetchone()["field"]
+    assert unit["field"] == stored, "the unit names the field that actually matched"
+    assert unit["next"] == 'knowledge_feed_get(name="prices", locator="key:quorum-bolt")'
+    assert hits[0].as_dict()["unit"] == unit, "and it reaches the caller"
+
+
+def test_a_unit_hit_reached_only_by_vectors_still_carries_the_unit(fed, monkeypatch):
+    """The dense side materialises its hit from the chunk alone, so it must attach the
+    unit too: the same cell would otherwise answer with and without the hint depending
+    on which retriever found it."""
+    from akasha import vectors
+
+    conn, cfg, cell = fed
+    monkeypatch.setattr(vectors, "enabled", lambda _cfg: True)
+    monkeypatch.setattr(vectors, "nearest", lambda _conn, _q, limit=1, repo=None: [cell])
+
+    hits = search(conn, "no-lexical-match-at-all", all_repos=True, cfg=cfg)
+
+    assert [h.id for h in hits] == [cell]
+    assert hits[0].unit["next"] == (
+        'knowledge_feed_get(name="prices", locator="key:quorum-bolt")')
+
+
+def test_search_hit_on_markdown_chunk_has_no_unit(env):
+    """A prose hit has no dataset row behind it, and an empty unit would spend the
+    caller's context saying nothing."""
+    conn, cfg = env
+    add_doc(conn, cfg, "Plain note", "## Cache\nunitless token here\n", repo="sample-repo")
+
+    hit = search(conn, "unitless", all_repos=True)[0]
+
+    assert hit.unit is None
+    assert "unit" not in hit.as_dict()

@@ -36,6 +36,8 @@ __all__ = [
     "LARGE_FILE_BYTES",
     "attach",
     "feed",
+    "get_unit",
+    "query_units",
     "redact_units",
     "unit_state",
 ]
@@ -562,3 +564,84 @@ def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
     return FeedResult(name=name, repo=resolved_repo, doc_id=row["id"], copy=copy,
                       units=len(units), diff=changes, unchanged=False,
                       renamed=split_result.renamed, warnings=warnings, redacted=redacted)
+
+
+def _field_names(units: list[Unit]) -> list[str]:
+    return sorted({field for unit in units for field in unit.fields})
+
+
+def _require_dataset(conn: sqlite3.Connection, name: str) -> None:
+    """Refuse a name that was never fed.
+
+    No units only means the dataset is empty when a stored state says it was fed; with
+    neither, the caller named a dataset that does not exist."""
+    if not feed_store.load_units(conn, name) and feed_store.stored_state(conn, name) is None:
+        raise KeyError(f"no dataset '{name}'")
+
+
+def get_unit(conn: sqlite3.Connection, name: str, locator: str) -> Unit:
+    """One stored row, addressed as `row:N` or `key:V`.
+
+    A locator copied out of a search hit has to read back what the feed stored, so this
+    reads the unit row itself; the chunk text renders the cell and is not the truth.
+    """
+    column, value = ("key", locator[len("key:"):]) if locator.startswith("key:") else (
+        "locator", locator)
+    row = conn.execute(
+        "SELECT locator, key, label, fields FROM feed_units"
+        f" WHERE dataset = ? AND {column} = ?", (name, value)).fetchone()
+    if row is None:
+        _require_dataset(conn, name)
+        raise KeyError(f"no unit {locator} in '{name}'")
+    return Unit(locator=row["locator"], key=row["key"], label=row["label"],
+                fields=json.loads(row["fields"]))
+
+
+def query_units(conn: sqlite3.Connection, name: str, where: list[str] | tuple = (),
+                fields: list[str] | None = None, limit: int = 20) -> list[Unit]:
+    """Rows whose cells match every `where` item, in stored order.
+
+    An item is `field=value` (the whole cell equals it) or `field~value` (the cell
+    contains it), split at its first operator so a value may hold one too. Both compare
+    case-insensitively, because the caller's spelling is not the export's.
+    """
+    units = feed_store.load_units(conn, name)
+    known = _field_names(units)
+
+    def checked(field: str) -> str:
+        if field not in known:
+            raise ValueError(f"unknown field '{field}'; fields: {', '.join(known)}")
+        return field
+
+    conditions: list[tuple[str, str, str]] = []
+    for item in where:
+        cuts = [at for at in (item.find("="), item.find("~")) if at >= 0]
+        if not cuts:
+            # Nothing tells a field from a value here, so name the fields the caller
+            # could have meant instead of silently matching every row.
+            raise ValueError(f"unknown field '{item}'; fields: {', '.join(known)}")
+        at = min(cuts)
+        conditions.append((checked(item[:at]), item[at], item[at + 1:]))
+
+    projected = [checked(field) for field in fields] if fields is not None else None
+    limit = max(1, min(100, limit))
+
+    def matches(unit: Unit) -> bool:
+        for field, operator, value in conditions:
+            cell = unit.fields.get(field, "").casefold()
+            if (cell != value.casefold() if operator == "="
+                    else value.casefold() not in cell):
+                return False
+        return True
+
+    found: list[Unit] = []
+    for unit in units:
+        if not matches(unit):
+            continue
+        if projected is not None:
+            unit = unit._replace(fields={field: unit.fields[field] for field in projected
+                                         if field in unit.fields})
+        found.append(unit)
+        if len(found) == limit:
+            break
+    return found
