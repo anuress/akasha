@@ -5,6 +5,7 @@ cell, so the suite needs no real export and no real knowledge base.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import re
@@ -13,6 +14,7 @@ import sys
 import threading
 import types
 from importlib import reload
+from pathlib import Path
 
 import pytest
 
@@ -22,6 +24,7 @@ from akasha.db import connect
 from akasha.markdown import parse_frontmatter
 from akasha.search import search
 from akasha.splitters import FeedSettings
+from pathlib import Path
 
 ROWS = "item,price\nbolt,4\nnut,2\n"
 
@@ -805,7 +808,7 @@ def test_windows_lock_retries_until_acquired(env, monkeypatch):
     def locking(_fd, mode, _size):
         modes.append(mode)
         if mode == fake.LK_LOCK and modes.count(fake.LK_LOCK) < 3:
-            raise OSError("locking failed: another process holds the file")
+            raise OSError(errno.EACCES, "locking failed: another process holds")
 
     fake.locking = locking
     monkeypatch.setitem(sys.modules, "fcntl", None)
@@ -850,3 +853,209 @@ def test_rollback_failure_still_restores_files_and_raises_original(env, source, 
     assert _doc(cfg).read_text() == doc_before
     assert _copy(cfg).read_bytes() == copy_before
     assert not list((cfg.knowledge_dir.parent / "files").rglob("*.staging*"))
+
+
+def test_windows_lock_reraises_an_error_that_is_not_contention(env, monkeypatch):
+    """Only contention is worth waiting for: retrying a bad handle forever would turn one
+    clear failure into a hang."""
+    _conn, cfg = env
+    attempts: list[int] = []
+    fake = types.SimpleNamespace(LK_LOCK=2, LK_NBLCK=3, LK_UNLCK=0)
+
+    def locking(_fd, mode, _size):
+        attempts.append(mode)
+        # Bounded on purpose: a loop that retries this fails the test instead of hanging.
+        if len(attempts) > 3:
+            raise AssertionError("retried an error that is not contention")
+        raise OSError(errno.EBADF, "bad file descriptor")
+
+    fake.locking = locking
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+
+    with pytest.raises(OSError, match="bad file descriptor"):
+        feed._lock(cfg, "prices")
+
+    assert len(attempts) == 1
+
+
+@pytest.mark.parametrize("name", ["*", "../x", "Prices", "null", "true", "false"])
+def test_names_that_cannot_round_trip_are_refused_by_both_commands(env, source, name):
+    """The name becomes a glob, a path and a frontmatter value, so `feed` and
+    `remove_dataset` check it the same way before either looks anything up: `*` and `../x`
+    would escape the datasets folder, and `null`/`true`/`false` read back as None and a
+    bool."""
+    conn, cfg = env
+
+    with pytest.raises(ValueError, match="invalid dataset name"):
+        feed.remove_dataset(conn, cfg, name)
+    with pytest.raises(ValueError, match="invalid dataset name"):
+        feed.feed(conn, cfg, source(), name, FeedSettings(key="item"), repo="sample-repo")
+
+    assert not (cfg.knowledge_dir.parent / "files" / ".locks").exists()
+    assert list(cfg.knowledge_dir.glob("*")) == []
+
+
+def test_restore_of_one_dataset_ignores_a_longer_name_in_the_trash(env, source):
+    """`sales` and `sales-2024` are two datasets, and both copies sit in the same trash
+    folder: a restore that matched `sales-` by prefix would hand `sales` the copy of
+    `sales-2024`."""
+    conn, cfg = env
+    settings = FeedSettings(key="item")
+    feed.feed(conn, cfg, source(), "sales", settings, repo="sample-repo")
+    feed.feed(conn, cfg, source(), "sales-2024", settings, repo="sample-repo")
+    sales_id = _doc_id(conn, cfg, "sales")
+    sales_doc_trash, sales_copy_trash = feed.remove_dataset(conn, cfg, "sales")
+    feed.remove_dataset(conn, cfg, "sales-2024")
+    sales_copy_trash.unlink()       # what a purge leaves behind for a tombstoned document
+
+    with pytest.raises(ValueError, match="copy purged"):
+        knowledge.restore(conn, cfg, sales_id)
+
+    assert sales_doc_trash.exists(), "the other dataset's copy was not taken for this one"
+
+
+def test_restore_ignores_a_symlinked_trash_entry(env, source, tmp_path):
+    """A symlink in the trash can point anywhere; a restore that followed one would copy
+    a file from outside the trash into the dataset's copy path."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    doc_id = _doc_id(conn, cfg)
+    _doc_trash, copy_trash = feed.remove_dataset(conn, cfg, "prices")
+    outside = tmp_path / "outside.csv"
+    outside.write_text("item,price\nother,0\n", encoding="utf-8")
+    copy_trash.unlink()
+    os.symlink(outside, copy_trash)
+
+    with pytest.raises(ValueError, match="copy purged"):
+        knowledge.restore(conn, cfg, doc_id)
+
+    assert outside.read_text(encoding="utf-8").startswith("item,price\nother")
+
+
+def test_failed_copy_move_leaves_the_dataset_in_the_trash(env, source, monkeypatch):
+    """A restore that moved the copy after unlinking the trashed document would lose the
+    document to a failed move; both files have to end up where they were."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    doc_id = _doc_id(conn, cfg)
+    doc_trash, copy_trash = feed.remove_dataset(conn, cfg, "prices")
+    real_replace = os.replace
+
+    def flaky_replace(src, dst):
+        if Path(str(src)).name.startswith("prices-"):
+            raise OSError("copy move failed")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(knowledge.os, "replace", flaky_replace)
+    with pytest.raises(OSError, match="copy move failed"):
+        knowledge.restore(conn, cfg, doc_id)
+
+    assert doc_trash.exists()
+    assert copy_trash.exists()
+    assert not _doc(cfg).exists()
+    assert not _copy(cfg).exists()
+    row = conn.execute("SELECT deleted_at FROM documents WHERE id = ?",
+                       (doc_id,)).fetchone()
+    assert row["deleted_at"]
+
+
+class _FailingUpdate:
+    """A connection whose tombstone UPDATE fails, so the document has already moved."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def execute(self, sql, *parameters):
+        if sql.lstrip().upper().startswith("UPDATE DOCUMENTS SET DELETED_AT"):
+            raise sqlite3.OperationalError("cannot write to the database")
+        return self._conn.execute(sql, *parameters)
+
+
+def test_remove_dataset_puts_the_doc_back_when_the_db_fails(env, source):
+    """`remove` moves the document to the trash before it touches the database, so a
+    failure there must move it back: a live row whose document sits in the trash is a
+    dataset nothing can feed, restore or purge."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    doc_text = _doc(cfg).read_text()
+    copy_bytes = _copy(cfg).read_bytes()
+
+    with pytest.raises(sqlite3.OperationalError, match="cannot write to the database"):
+        feed.remove_dataset(_FailingUpdate(conn), cfg, "prices")
+
+    assert _doc(cfg).read_text() == doc_text
+    assert _copy(cfg).read_bytes() == copy_bytes
+    assert not list((cfg.knowledge_dir.parent / "trash").rglob("*__prices.md"))
+    assert conn.in_transaction is False
+
+
+def test_refeed_after_remove_leaves_nothing_untracked_in_the_trash(env, source):
+    """A re-feed drops the tombstone of the removed dataset, so that document file must go
+    with it; left behind it is a file no row points at and no purge will ever reach."""
+    conn, cfg = env
+    settings = FeedSettings(key="item")
+    trash = cfg.knowledge_dir.parent / "trash"
+    feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
+    feed.remove_dataset(conn, cfg, "prices")
+
+    feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
+
+    assert not list(trash.rglob("*__prices.md"))
+    assert knowledge.purge(conn, cfg) == 1        # the removed copy is still purgeable
+    assert list(trash.rglob("*")) == []
+
+
+def test_restore_dataset_waits_for_the_name_lock(env, source, tmp_path):
+    """A restore moves the copy back and reindexes, so it has to wait for a feed of the
+    same name rather than trade the copy path with it."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    doc_id = _doc_id(conn, cfg)
+    feed.remove_dataset(conn, cfg, "prices")
+    hold = feed._lock(cfg, "prices")
+    started = threading.Event()
+    done = threading.Event()
+    outcome: list = []
+
+    def run():
+        worker = connect(tmp_path / "s.db")
+        started.set()
+        try:
+            outcome.append(knowledge.restore(worker, cfg, doc_id))
+        except BaseException as exc:
+            outcome.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert started.wait(5) is True
+        assert done.wait(0.3) is False       # blocked on the lock this test holds
+    finally:
+        feed._unlock(hold)
+    assert done.wait(10) is True
+    thread.join()
+    assert isinstance(outcome[0], Path)
+    assert _copy(cfg).exists()
+
+
+def test_purge_removes_a_copy_trashed_before_the_cutoff(env, source):
+    """A copy's age is the stamp in its name, the way a document's is `deleted_at`, so a
+    cutoff has to reach one trashed long ago and leave a fresh one alone."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    _doc_trash, copy_trash = feed.remove_dataset(conn, cfg, "prices")
+    old = copy_trash.with_name("prices-20200101T000000.csv")
+    copy_trash.rename(old)
+    fresh = copy_trash
+    fresh.write_bytes(b"item,price\nbolt,4\n")
+
+    assert knowledge.purge(conn, cfg, older_than_days=1) == 1
+
+    assert not old.exists()
+    assert fresh.exists()

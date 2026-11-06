@@ -11,11 +11,13 @@ entirely or leaves the previous feed untouched.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +51,13 @@ ALLOWED_SUFFIXES = (".csv", ".xlsx")
 # Directories akasha owns inside `files/`: a repo of that name would put a dataset where
 # the lock files and the trash live.
 RESERVED_REPOS = frozenset({".locks", ".trash"})
+
+# `msvcrt.locking` reports contention as EACCES, and a lock it would deadlock on as EDEADLK.
+LOCK_CONTENTION_ERRNOS = frozenset({errno.EACCES, errno.EDEADLK})
+LOCK_RETRY_SECONDS = 0.1
+
+# Names frontmatter would read back as a literal instead of as the name it is.
+LITERAL_NAMES = frozenset({"null", "true", "false"})
 
 # Above this the feed still happens: the warning says what it will cost.
 LARGE_FILE_BYTES = 50 * 1024 * 1024
@@ -260,9 +269,21 @@ def trashed_copies(cfg: Config, repo: str, name: str) -> list[Path]:
     restore puts back.
     """
     folder = cfg.knowledge_dir.parent / "files" / ".trash" / repo
-    found = [path for suffix in ALLOWED_SUFFIXES
-             for path in folder.glob(f"{name}-*{suffix}") if path.is_file()]
-    return sorted(found, key=lambda path: path.name)
+    root = folder.resolve()
+    found: list[tuple[str, Path]] = []
+    for suffix in ALLOWED_SUFFIXES:
+        # Exactly its own stamp, not a prefix: `sales` must not match `sales-2024-<stamp>`.
+        pattern = re.compile(re.escape(name) + r"-(\d{8}T\d{6})" + re.escape(suffix))
+        for path in folder.glob(f"{name}-*{suffix}"):
+            match = pattern.fullmatch(path.name)
+            # A symlink in the trash can point anywhere, and a restore that followed one
+            # would copy a file from outside the trash into the dataset's copy path.
+            if match is None or path.is_symlink() or not path.is_file():
+                continue
+            if not path.resolve().is_relative_to(root):
+                continue
+            found.append((match.group(1), path))
+    return [path for _stamp, path in sorted(found, key=lambda item: item[0])]
 
 
 def _lock(cfg: Config, name: str) -> IO[str]:
@@ -281,13 +302,17 @@ def _lock(cfg: Config, name: str) -> IO[str]:
         import msvcrt
         handle.seek(0)
         # `LK_LOCK` gives up after about ten seconds where `flock` blocks until it has the
-        # lock, so the retry is what makes both platforms wait instead of fail.
+        # lock, so the retry is what makes both platforms wait instead of fail. Only
+        # contention is worth waiting for; a bad handle has to fail at once.
         while True:
             try:
                 msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
                 break
-            except OSError:
-                continue
+            except OSError as failure:
+                if failure.errno not in LOCK_CONTENTION_ERRNOS:
+                    handle.close()
+                    raise
+                time.sleep(LOCK_RETRY_SECONDS)
     else:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
     return handle
@@ -421,6 +446,22 @@ def _move_copies_aside(cfg: Config, repo: str, name: str,
         moved.append((backup, old))
 
 
+def _checked_name(name: str) -> str:
+    """The dataset name as the commands accept it, or the ValueError saying why not.
+
+    Shared by `feed` and `remove_dataset`: the name becomes a glob, a path segment and a
+    frontmatter value, so one that cannot be all three safely must not be created or
+    looked up at all.
+    """
+    reason = kinds.custom_kind_error(name)
+    if reason is not None:
+        raise ValueError(f"invalid dataset name {name!r}: {reason}")
+    if name in LITERAL_NAMES:
+        raise ValueError(
+            f"invalid dataset name {name!r}: frontmatter would read it as a JSON literal")
+    return name
+
+
 def feed(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
          settings: FeedSettings | None = None, repo: str | None = None) -> FeedResult:
     """Copy a table export into the knowledge base and make its cells searchable.
@@ -431,9 +472,7 @@ def feed(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
     transaction whose failure restores every file it touched.
     """
     path = Path(path)
-    reason = kinds.custom_kind_error(name)
-    if reason is not None:
-        raise ValueError(f"invalid dataset name {name!r}: {reason}")
+    _checked_name(name)
     handle = _lock(cfg, name)
     try:
         return _feed_locked(conn, cfg, path, name, settings, repo)
@@ -490,6 +529,7 @@ def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
 
     staging = _staging_path(cfg, resolved_repo, name, suffix)
     backups: list[tuple[Path, Path]] = []
+    stale: list[Path] = []
     failures_before = len(ATTACH_ERRORS)
     swapped = False
     doc_written = False
@@ -525,7 +565,7 @@ def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
         swapped = True
         conn.execute("BEGIN IMMEDIATE")
         feed_store.replace_units(conn, name, units, state)
-        _drop_removed_copy(conn, cfg, name)
+        stale = _drop_removed_copy(conn, cfg, name)
         doc_path.parent.mkdir(parents=True, exist_ok=True)
         doc_written = True
         doc_path.write_text(text)
@@ -587,6 +627,12 @@ def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
         except OSError as exc:
             # The feed has landed; a leftover backup can only be reported, not undone.
             warnings.append(f"left {backup.name} behind: {exc}")
+    # Only now: a rolled-back feed keeps the tombstones these files belong to.
+    for removed in stale:
+        try:
+            removed.unlink(missing_ok=True)
+        except OSError as exc:
+            warnings.append(f"left {removed.name} behind: {exc}")
     try:
         vectors.index_chunks(conn, cfg)
     except Exception as exc:                                     # noqa: BLE001
@@ -690,6 +736,7 @@ def remove_dataset(conn: sqlite3.Connection, cfg: Config, name: str) -> tuple[Pa
     can put it straight back; the unit rows, the cell mapping and the document's tombstone
     then land in one transaction. `knowledge.restore` and `feed` are what put a name back.
     """
+    _checked_name(name)
     handle = _lock(cfg, name)
     try:
         doc = _dataset_doc(cfg, name)
@@ -698,6 +745,7 @@ def remove_dataset(conn: sqlite3.Connection, cfg: Config, name: str) -> tuple[Pa
         if row is None:
             raise KeyError(f"no dataset '{name}'")
         repo = doc.parent.parent.name
+        doc_trash = knowledge._doc_trash_path(cfg, row["id"], doc)
         moved: list[tuple[Path, Path]] = []
         for suffix in ALLOWED_SUFFIXES:
             old = _copy_path(cfg, repo, name, suffix)
@@ -724,21 +772,26 @@ def remove_dataset(conn: sqlite3.Connection, cfg: Config, name: str) -> tuple[Pa
                     exc.add_note(f"could not roll back: {failure}")
             for trashed, old in moved:
                 os.replace(trashed, old)
+            # `remove` moves the document before it writes, so a failure here has to put
+            # that back too: a live row beside a document in the trash is torn.
+            if not doc.exists() and doc_trash.exists():
+                os.replace(doc_trash, doc)
             raise
         return doc_trash, copy_trash
     finally:
         _unlock(handle)
 
 
-def _drop_removed_copy(conn: sqlite3.Connection, cfg: Config, name: str) -> None:
+def _drop_removed_copy(conn: sqlite3.Connection, cfg: Config, name: str) -> list[Path]:
     """Forget the tombstone a removed dataset of this name left behind.
 
     `index_path` derives a document id from its path, and a tombstone still holds the id
     of the path this feed is about to create again, so leaving it in place collides with
-    its own trash. It would also let an older dataset of the same name be restored over
-    the copy this feed installs. The trashed document file stays on disk.
+    its own trash. Returns the trashed files the caller unlinks once it has committed:
+    left behind they are files no row points at, which `purge` can never reach.
     """
     trash = cfg.knowledge_dir.parent / "trash"
+    stale: list[Path] = []
     for row in conn.execute(
             "SELECT id, path FROM documents WHERE deleted_at IS NOT NULL").fetchall():
         if (Path(row["path"]).parent != trash
@@ -748,3 +801,5 @@ def _drop_removed_copy(conn: sqlite3.Connection, cfg: Config, name: str) -> None
         conn.execute("DELETE FROM links WHERE from_document_id = ? OR to_document_id = ?",
                      (row["id"], row["id"]))
         conn.execute("DELETE FROM documents WHERE id = ?", (row["id"],))
+        stale.append(Path(row["path"]))
+    return stale
