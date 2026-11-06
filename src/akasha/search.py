@@ -71,11 +71,13 @@ def _unit_info(dataset: str | None, locator: str | None, key: str | None,
         return None
     identity = f"key:{key}" if key else locator
     # JSON-quoted: a key comes from an export and may hold a quote, a backslash or a
-    # newline, any of which would make the hint an unparseable call. An ordinary value
-    # renders exactly as a hand-written call would.
+    # newline, any of which would make the hint an unparseable call. `ensure_ascii=False`
+    # keeps a non-ASCII key literal, since an escaped one pasted into the call names a row
+    # `feed_units` never stored; an ordinary value renders as a hand-written call would.
     return {"dataset": dataset, "locator": locator, "key": key, "field": field,
             "next": "knowledge_feed_get(name=%s, locator=%s)" % (
-                json.dumps(dataset), json.dumps(identity))}
+                json.dumps(dataset, ensure_ascii=False),
+                json.dumps(identity, ensure_ascii=False))}
 
 
 def _escape(q: str, mode: str = "all") -> str:
