@@ -21,10 +21,10 @@ import pytest
 from akasha import feed, feed_store, knowledge
 from akasha.config import load_config
 from akasha.db import connect
+from akasha.index import index_path
 from akasha.markdown import parse_frontmatter
 from akasha.search import search
 from akasha.splitters import FeedSettings
-from pathlib import Path
 
 ROWS = "item,price\nbolt,4\nnut,2\n"
 
@@ -1007,6 +1007,9 @@ def test_refeed_after_remove_leaves_nothing_untracked_in_the_trash(env, source):
     assert not list(trash.rglob("*__prices.md"))
     assert knowledge.purge(conn, cfg) == 1        # the removed copy is still purgeable
     assert list(trash.rglob("*")) == []
+    # An empty repo folder may stay behind; a copy file may not.
+    copies = cfg.knowledge_dir.parent / "files" / ".trash"
+    assert [p for p in copies.rglob("*") if p.is_file()] == []
 
 
 def test_restore_dataset_waits_for_the_name_lock(env, source, tmp_path):
@@ -1059,3 +1062,103 @@ def test_purge_removes_a_copy_trashed_before_the_cutoff(env, source):
 
     assert not old.exists()
     assert fresh.exists()
+
+
+def _hand_written(cfg, name, frontmatter, body="## A\nmarker\n", folder="sample-repo"):
+    """A document written straight to disk, as another writer or an older akasha would."""
+    path = cfg.knowledge_dir / folder / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"---\n{frontmatter}---\n\n{body}", encoding="utf-8")
+    return path
+
+
+def test_refeed_never_drops_a_removed_note_that_shares_the_dataset_name(env, source):
+    """A removed note named `prices.md` leaves the same trash file name a removed dataset
+    would; dropping that tombstone to make room for a feed would delete a document the
+    user can still restore."""
+    conn, cfg = env
+    note = _hand_written(cfg, "prices.md", "id: k_note\ntitle: Prices\nkind: reference\n"
+                                          "repo: sample-repo\nstatus: active\n"
+                                          "created: 2026-01-01\n"
+                                          "updated: 2026-01-01\n",
+                        body="## A\nordinary prose marker\n")
+    index_path(conn, cfg, note, "native", root=None)
+    note_id = conn.execute("SELECT id FROM documents WHERE path = ?",
+                           (str(note),)).fetchone()["id"]
+    note_trash = knowledge.remove(conn, cfg, note_id)
+
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+
+    row = conn.execute("SELECT path, deleted_at FROM documents WHERE id = ?",
+                       (note_id,)).fetchone()
+    assert row is not None and row["deleted_at"], "the note's tombstone is not a dataset's"
+    assert note_trash.exists() and "ordinary prose marker" in note_trash.read_text()
+    restored = knowledge.restore(conn, cfg, note_id)
+    assert "ordinary prose marker" in restored.read_text()
+
+
+def test_restore_treats_a_dataset_key_without_the_kind_as_a_note(env):
+    """`feed` writes `kind: dataset` and the name together; a note that only carries the
+    key would otherwise be restored as a dataset and demand a copy it never had."""
+    conn, cfg = env
+    note = _hand_written(cfg, "plain.md", "id: k_plain\ntitle: Plain\nkind: reference\n"
+                                          "repo: sample-repo\ndataset: prices\n"
+                                          "status: active\n"
+                                          "created: 2026-01-01\nupdated: 2026-01-01\n",
+                        body="## A\nplain marker\n")
+    index_path(conn, cfg, note, "native", root=None)
+    note_id = conn.execute("SELECT id FROM documents WHERE path = ?",
+                           (str(note),)).fetchone()["id"]
+    knowledge.remove(conn, cfg, note_id)
+
+    restored = knowledge.restore(conn, cfg, note_id)
+
+    assert "plain marker" in restored.read_text()
+    assert restored.parent == cfg.knowledge_dir / "sample-repo"
+
+
+def test_restore_dataset_refuses_to_overwrite_a_copy_already_in_place(env, source):
+    """The copy path is the live dataset's own; a restore that replaced it would swap one
+    dataset's bytes under another's document."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    doc_id = _doc_id(conn, cfg)
+    doc_trash, copy_trash = feed.remove_dataset(conn, cfg, "prices")
+    _copy(cfg).write_text("item,price\nlive,1\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="already"):
+        knowledge.restore(conn, cfg, doc_id)
+
+    assert _copy(cfg).read_text(encoding="utf-8") == "item,price\nlive,1\n"
+    assert doc_trash.exists() and copy_trash.exists()
+    row = conn.execute("SELECT deleted_at FROM documents WHERE id = ?",
+                       (doc_id,)).fetchone()
+    assert row["deleted_at"]
+
+
+def test_restore_dataset_refreshes_the_vectors_of_its_cells(env, source, monkeypatch):
+    """A removal deletes the chunks but leaves their vectors behind, and the restore's
+    reindex makes fresh chunk ids, so without a vector pass every cell has none."""
+    import numpy as np
+
+    from akasha import vectors
+
+    conn, cfg = env
+    if vectors.missing_modules() or not vectors.available(conn):
+        pytest.skip("the vectors extra is not usable here")
+
+    def encode(texts):
+        return np.array([[1.0] + [0.0] * 255 for _ in texts], dtype=np.float32)
+
+    monkeypatch.setattr(vectors, "_encoder", lambda: encode)
+    cfg.embeddings_provider = "model2vec"
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    doc_id = _doc_id(conn, cfg)
+    feed.remove_dataset(conn, cfg, "prices")
+    assert conn.execute("SELECT COUNT(*) c FROM chunks").fetchone()["c"] == 0
+
+    knowledge.restore(conn, cfg, doc_id)
+
+    chunk_ids = {r["id"] for r in conn.execute("SELECT id FROM chunks")}
+    vector_ids = {r["chunk_id"] for r in conn.execute("SELECT chunk_id FROM vec_chunks")}
+    assert chunk_ids and chunk_ids <= vector_ids

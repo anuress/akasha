@@ -565,7 +565,7 @@ def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
         swapped = True
         conn.execute("BEGIN IMMEDIATE")
         feed_store.replace_units(conn, name, units, state)
-        stale = _drop_removed_copy(conn, cfg, name)
+        stale = _drop_removed_copy(conn, cfg, name, resolved_repo)
         doc_path.parent.mkdir(parents=True, exist_ok=True)
         doc_written = True
         doc_path.write_text(text)
@@ -782,20 +782,28 @@ def remove_dataset(conn: sqlite3.Connection, cfg: Config, name: str) -> tuple[Pa
         _unlock(handle)
 
 
-def _drop_removed_copy(conn: sqlite3.Connection, cfg: Config, name: str) -> list[Path]:
+def _drop_removed_copy(conn: sqlite3.Connection, cfg: Config, name: str,
+                       repo: str) -> list[Path]:
     """Forget the tombstone a removed dataset of this name left behind.
 
     `index_path` derives a document id from its path, and a tombstone still holds the id
     of the path this feed is about to create again, so leaving it in place collides with
     its own trash. Returns the trashed files the caller unlinks once it has committed:
     left behind they are files no row points at, which `purge` can never reach.
+
+    Only a tombstone whose trashed file is this repo's fed dataset is dropped: a removed
+    note called `<name>.md` leaves the same file name, and dropping that one would delete
+    a document the user can still restore.
     """
     trash = cfg.knowledge_dir.parent / "trash"
     stale: list[Path] = []
     for row in conn.execute(
             "SELECT id, path FROM documents WHERE deleted_at IS NOT NULL").fetchall():
-        if (Path(row["path"]).parent != trash
-                or Path(row["path"]).name != f"{row['id']}__{name}.md"):
+        path = Path(row["path"])
+        if path.parent != trash or path.name != f"{row['id']}__{name}.md":
+            continue
+        evidence = knowledge._trashed_dataset(path) if path.is_file() else None
+        if evidence is None or evidence[0] != name or (evidence[1] or "_global") != repo:
             continue
         conn.execute("DELETE FROM chunks WHERE document_id = ?", (row["id"],))
         conn.execute("DELETE FROM links WHERE from_document_id = ? OR to_document_id = ?",

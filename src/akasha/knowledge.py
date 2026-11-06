@@ -621,9 +621,10 @@ def restore(conn: sqlite3.Connection, cfg: Config, doc_id: str) -> Path:
     trashed = Path(row["path"])
     if not trashed.exists():
         raise ValueError(f"{doc_id} has no file in the trash to restore; purge the row instead")
-    dataset = _trashed_dataset(trashed)
-    if dataset is None:
+    found = _trashed_dataset(trashed)
+    if found is None:
         return _restore_locked(conn, cfg, row, trashed, None)
+    dataset = found[0]
     from akasha.feed import _lock, _unlock       # feed imports this module
     handle = _lock(cfg, dataset)
     try:
@@ -689,24 +690,44 @@ def _restore_locked(conn: sqlite3.Connection, cfg: Config, row: sqlite3.Row,
             exc.add_note(f"could not move the files back: {failure}")
         raise
     _reindex(conn, cfg, target)
+    if dataset is not None:
+        # The removal took the old chunk ids and their vectors away, and the reindex made
+        # fresh ids, so without this pass a restored dataset answers by keyword only. A
+        # failure is derived data that `akasha index` rebuilds; the restore has committed.
+        try:
+            from akasha import vectors
+
+            vectors.index_chunks(conn, cfg)
+        except Exception as exc:                                 # noqa: BLE001
+            from akasha.events import emit
+
+            emit(conn, "knowledge.vectors_failed", id=doc_id, error=str(exc))
     return target
 
-def _trashed_dataset(trashed: Path) -> str | None:
-    """The dataset a trashed document belongs to, or None for any other document.
+def _trashed_dataset(trashed: Path) -> tuple[str, str | None] | None:
+    """The dataset a trashed document belongs to and its repo, or None for any other
+    document, as `(name, repo)`.
 
-    `feed` writes the name into the frontmatter, and a note that merely claims
-    `kind: dataset` has none: the path is gone once the document is in the trash, so the
-    file is what says which dataset it was.
+    `feed` writes `kind: dataset`, the name and the repo together, and it is the only
+    writer that does. The path that says the same is gone once the document is in the
+    trash, so the file is the evidence: a note that merely carries a `dataset:` key was
+    never fed and has no copy to bring back.
     """
     meta, _body = parse_frontmatter(trashed.read_text(errors="replace"))
+    if str(meta.get("kind", "")).strip().casefold() != "dataset":
+        return None
     name = meta.get("dataset")
-    return name if isinstance(name, str) and name else None
+    if not isinstance(name, str) or not name:
+        return None
+    repo = meta.get("repo")
+    return name, repo if isinstance(repo, str) and repo else None
 
 def _dataset_copy_back(cfg: Config, row: sqlite3.Row, name: str) -> tuple[Path, Path]:
     """The newest trashed copy of a dataset document, and where it goes back to.
 
     Resolved before anything moves: a copy that is gone leaves the document in the trash,
-    rather than restored without the file its cells are split from.
+    rather than restored without the file its cells are split from, and a live copy at the
+    target would be replaced by this one's bytes.
     """
     from akasha.feed import _copy_path, trashed_copies   # feed imports this module
 
@@ -715,7 +736,11 @@ def _dataset_copy_back(cfg: Config, row: sqlite3.Row, name: str) -> tuple[Path, 
     candidates = trashed_copies(cfg, row["repo"], name)
     if not candidates:
         raise ValueError("copy purged; feed the file again with akasha feed add")
-    return candidates[-1], _copy_path(cfg, row["repo"], name, candidates[-1].suffix)
+    copy_target = _copy_path(cfg, row["repo"], name, candidates[-1].suffix)
+    if copy_target.exists():
+        raise ValueError(
+            f"{copy_target} already exists; move it away before restoring '{name}'")
+    return candidates[-1], copy_target
 
 def purge(conn: sqlite3.Connection, cfg: Config, older_than_days: int | None = None) -> int:
     """Permanently delete trashed documents, and trashed dataset copies.
