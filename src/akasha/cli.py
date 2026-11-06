@@ -19,7 +19,7 @@ from akasha.features import add_alias, list_features, resolve_feature, show as f
 from akasha.gitctx import git_context, resolve_repo
 from akasha.index import forget, index_all
 from akasha.search import iso_date, search as do_search
-from akasha.splitters import FeedSettings
+from akasha.splitters import FeedSettings, clean_headers
 
 # Failures a person can act on are printed as one line, never a traceback.
 EXPECTED_ERRORS = (ValueError, KeyError, PermissionError, kb.StaleWrite, kb.ReadOnlySource,
@@ -639,11 +639,15 @@ def cmd_feed_list(args) -> int:
 def _unit_row(cfg, unit) -> dict:
     """One row as it is printed: defused by the scan policy, with the locator as stored
     because `row:N` is the row, not export data."""
+    # Two headers can redact to one placeholder; `clean_headers` numbers the later one the
+    # way it numbers a duplicate column, where a dict keyed by the scrubbed name would
+    # drop a whole field.
+    names, _renamed = clean_headers([_scrub(cfg, field) for field in unit.fields])
     return {"locator": unit.locator,
             "key": _scrub(cfg, unit.key) if unit.key is not None else None,
             "label": _scrub(cfg, unit.label),
-            "fields": {_scrub(cfg, field): _scrub(cfg, value)
-                       for field, value in unit.fields.items()}}
+            "fields": {name: _scrub(cfg, value)
+                       for name, value in zip(names, unit.fields.values())}}
 
 
 def _print_unit(row: dict) -> None:
@@ -693,6 +697,19 @@ def cmd_feed_rm(args) -> int:
     # The trash name is `<doc id>__<name>.md`, as `restore` reads it.
     print(f"restore with: akasha knowledge restore {doc_trash.name.partition('__')[0]}")
     return 0
+
+
+def _error_text(args, exc) -> str:
+    """The line `main` prints for an expected failure.
+
+    A feed error quotes export text — a stored field name, a column header — so it passes
+    the same redaction the rest of that command's output does. Once, here, rather than at
+    every place a feed command can fail.
+    """
+    message = _message(exc)
+    if getattr(args, "feed_command", None) is None:
+        return message
+    return _scrub(load_config(), message)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -965,5 +982,5 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except EXPECTED_ERRORS as exc:
-        print(_message(exc))
+        print(_error_text(args, exc))
         return 1

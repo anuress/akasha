@@ -1466,3 +1466,15 @@ def test_first_feed_without_key_is_refused_by_core(env, source):
     assert not _doc(cfg).exists()
     assert not _copy(cfg).exists()
     assert feed_store.load_units(conn, "prices") == []
+
+
+def test_core_feed_refuses_header_row_below_one(env, source):
+    """`FeedSettings` is constructible directly, so the 1-based rule has to hold in core: a
+    header_row below 1 reads row 1 as the headers and persists settings that lie about it."""
+    conn, cfg = env
+    with pytest.raises(ValueError, match="header_row must be >= 1"):
+        feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item", header_row=0),
+                  repo="sample-repo")
+    assert not _doc(cfg).exists()
+    assert not _copy(cfg).exists()
+    assert feed_store.load_units(conn, "prices") == []

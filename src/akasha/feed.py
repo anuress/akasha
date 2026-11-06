@@ -583,6 +583,10 @@ def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
         # a row across imports, and a first feed without one leaves the next import
         # nothing to compare against.
         raise ValueError(f"first feed of '{name}' needs settings.key")
+    if settings.header_row < 1:
+        # A `FeedSettings` built directly reaches the splitter without the frontmatter
+        # validation, and a header_row of 0 reads row 1 as the headers anyway.
+        raise ValueError("header_row must be >= 1")
 
     copy = _copy_path(cfg, resolved_repo, name, suffix)
     file_sha = hashlib.sha256(data).hexdigest()

@@ -835,3 +835,37 @@ def test_feed_rm_without_copy_prints_no_copy_line(home, tmp_path, capsys):
     out = _out(capsys)
     assert "document: " in out and "restore with: akasha knowledge restore " in out
     assert "copy: " not in out
+
+
+def test_feed_error_messages_are_redacted(home, tmp_path, capsys):
+    """`query` lists the fields it knows, and a column header can be secret-shaped, so an
+    error printed unchanged would leak exactly what the rest of the output redacts."""
+    source = tmp_path / "fruits.csv"
+    source.write_text("fruit,Authorization: Bearer abcdef1234567890abcdef\napple,red\n",
+                      encoding="utf-8")
+    assert main(["feed", "add", str(source), "--as", "fruits", "--repo", "sample-repo",
+                 "--key", "fruit"]) == 0
+    capsys.readouterr()
+
+    assert main(["feed", "query", "fruits", "--where", "nope=1"]) == 1
+    captured = capsys.readouterr()
+    assert "abcdef1234567890abcdef" not in captured.out + captured.err
+    assert "[REDACTED:" in captured.out
+
+
+def test_redacted_field_names_do_not_overwrite_each_other(home, tmp_path, capsys):
+    """Two headers can redact to one placeholder: a dict keyed by the scrubbed name would
+    drop the second column, so the later one is numbered like a duplicate header."""
+    source = tmp_path / "fruits.csv"
+    source.write_text("fruit,Authorization: Bearer aaaa1111aaaa1111,"
+                      "Authorization: Bearer bbbb2222bbbb2222\napple,red,green\n",
+                      encoding="utf-8")
+    assert main(["feed", "add", str(source), "--as", "fruits", "--repo", "sample-repo",
+                 "--key", "fruit"]) == 0
+    capsys.readouterr()
+
+    assert main(["feed", "get", "fruits", "row:2", "--json"]) == 0
+    fields = json.loads(_out(capsys))["fields"]
+    assert list(fields) == ["fruit", "[REDACTED:bearer]", "[REDACTED:bearer] (2)"]
+    assert fields["[REDACTED:bearer]"] == "red"
+    assert fields["[REDACTED:bearer] (2)"] == "green"
