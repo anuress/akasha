@@ -25,3 +25,15 @@ resource, and every capability should be judged from the caller's side.
 - Comments explain why, not what, and carry no history.
 - Version is `0.0.x`; bump the patch only.
 - Keep commits passing the pre-commit hooks and CI.
+
+## Adding a file format
+
+A format is one function in `splitters.SPLITTERS`, keyed by the lowercased extension, that
+returns a `SplitResult`: the `Unit(locator, key, label, fields)` rows, the headers, the
+headers it had to rename, and any warnings. The indexer needs no change, because `feed`
+splits, diffs and chunks whatever the table maps to. Add tests to `tests/test_splitters.py`
+and use synthetic data only: the repository is public.
+
+A dependency a format needs is imported inside its splitter and declared as an extra, so the
+package installs without it. When the import fails, the message names the extra, the way
+`xlsx` asks for `uv tool install 'akasha-mcp[xlsx]'`.

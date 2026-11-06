@@ -116,7 +116,7 @@ Search defaults to the repo of the current checkout; `--all` searches every repo
 
 ## Tools
 
-Eleven MCP tools:
+Fourteen MCP tools:
 
 | Tool | What it does |
 |---|---|
@@ -131,6 +131,86 @@ Eleven MCP tools:
 | `knowledge_related` | Linked documents: citations and backlinks |
 | `feature_show` | How many documents carry a feature tag |
 | `doctor` | What is degraded about the installation |
+| `knowledge_feed` | Feed a .csv/.xlsx export as a searchable dataset; reports what changed |
+| `knowledge_feed_get` | One dataset row by `row:N` or `key:V` |
+| `knowledge_feed_query` | Filter rows: `F=v` exact, `F~v` contains |
+
+## Feeding files
+
+An exported sheet becomes a dataset: one document plus the stored copy its cells were split
+from. Every non-empty cell is its own chunk, so search finds the cell, and the hit carries
+`unit` (dataset, locator, key, field) with the exact `next` call that reads the whole row.
+
+```sh
+akasha feed add fruits.csv --as fruits --key id
+```
+
+The first feed prints `first feed: 8 units`. Feeding the same name again replaces its rows
+and reports what changed: `+1 -0 ~2`, then one line per row, with a changed cell shown as
+`color: -red` and `color: +green`. The listing stops at 50 rows with `… N more (use --full)`;
+`--full` prints every row and every change line of a cell. A feed that changes nothing prints
+`unchanged`.
+
+A row is addressed two ways: `row:N` is its place in the export (`row:2` is the first data
+row under a header on row 1), `key:V` is the value of the `--key` column.
+
+```sh
+akasha feed list
+akasha feed get fruits key:3
+akasha feed query fruits --where season=summer --fields name,color
+```
+
+- `feed list`: name, repo, units, feed date and copy path of every dataset.
+- `feed get`: one row; `--json` prints it as an object.
+- `feed query`: `F=v` matches a whole cell, `F~v` a cell containing the value, both
+  case-insensitive; every `--where` must match. `--limit` defaults to 20 (max 100).
+
+Settings live on `feed add`:
+
+| Flag | Effect |
+|---|---|
+| `--key COL` | Column whose value addresses a row across feeds; a first feed needs one |
+| `--sheet NAME` | xlsx sheet; the first sheet unless one is named |
+| `--header-row N` | Row holding the column headers (default 1) |
+| `--require COL` | Keep only rows with a value in this column (repeatable) |
+| `--exclude COL` | Drop this column from the stored rows (repeatable) |
+| `--label TEMPLATE` | Row label with `{column}` placeholders, e.g. `'{id} {name}'` |
+
+Any setting flag replaces the whole stored settings object, so a re-feed that leaves `--key`
+out is a feed whose rows are addressed by row number again; `feed add` prints
+`settings replaced: ...` when it happens. With no setting flag at all, the last feed's
+settings are reused.
+
+`--repo NAME` feeds under a repo other than the one the current checkout resolves to;
+`--repo '*'` is refused, because a dataset belongs to one repo. The name is global to the
+installation, so feeding one name under a second repo is refused rather than quietly
+divergent: use another name, or `feed rm` the first one.
+
+The copy is `~/.akasha/files/<repo>/<name>.<ext>`, the document is
+`~/.akasha/knowledge/<repo>/datasets/<name>.md`. The cells are split from that copy, so
+re-feeding replaces it.
+
+`xlsx` needs an extra:
+
+```sh
+uv tool install --python 3.12 'akasha-mcp[xlsx]'
+```
+
+Without it the splitter names the extra, and `doctor` reports it for as long as an xlsx
+dataset exists.
+
+The document is generated: `knowledge update`, `knowledge append`, `knowledge archive`
+and `knowledge rm` refuse it and point at `feed add`; `akasha feed rm fruits` moves
+document and copy to the trash and prints the id `knowledge restore` takes. A restore is
+refused while a dataset of that name is live, and `knowledge purge` deletes trashed copies
+too.
+
+In detail: `fsck` reports a copy that is missing or edited (error), units that no longer
+match the copy (warning; `akasha index --force` repairs them), damaged metadata, a copy no
+readable document names, and a staging or backup file an interrupted feed left behind.
+`doctor` reports the last failed attach of a dataset whose units are still not its own, and
+the `xlsx` extra while an xlsx dataset exists. Search keeps answering from the units already
+stored while either is unresolved, which is why the finding names the re-feed that fixes it.
 
 ## Hooks
 
