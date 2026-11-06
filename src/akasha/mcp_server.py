@@ -534,18 +534,16 @@ def _shrink_to(item: dict, budget: int) -> dict:
             item.setdefault("withheld_chars", {})
             item["withheld_chars"][name] = (item["withheld_chars"].get(name, 0)
                                             + len(value) - keep)
-    dropped = 0
-    # Reversed, so the columns cut first are the ones kept when any can stay.
-    for name in reversed(list(item["fields"])):
-        if len(_json(item)) <= budget:
-            break
+    # Measured after each drop and its marker: `withheld_fields` is part of the row, so a
+    # row that fits just before it is added does not fit after. Reversed, so the columns cut
+    # first are the ones kept when any can stay.
+    while item["fields"] and len(_json(item)) > budget:
+        name = list(item["fields"])[-1]
         del item["fields"][name]
         item.get("withheld_chars", {}).pop(name, None)
-        dropped += 1
-    if dropped:
-        item["withheld_fields"] = dropped
         if not item.get("withheld_chars"):
             item.pop("withheld_chars", None)
+        item["withheld_fields"] = item.get("withheld_fields", 0) + 1
     return item
 
 
@@ -558,11 +556,14 @@ def _knowledge_feed_query(args: dict):
     units: list[dict] = []
     fired: set[str] = set()
     used = 0
-    # The envelope counts against the ceiling too, or the braces would put it over.
-    budget = MAX_FEED_RESPONSE_CHARS - len(_json({"units": []}))
+    # Every part of the answer counts against the ceiling, including what is added after the
+    # size checks: the envelope, the comma before a second row, and `withheld_units`.
+    envelope = len(_json({"units": []}))
+    marker = len(',"withheld_units":') + len(str(len(found)))
+    budget = MAX_FEED_RESPONSE_CHARS - envelope - marker
     for unit in found:
         item = _unit_json(cfg, unit, fired)
-        size = len(_json(item))
+        size = len(_json(item)) + (1 if units else 0)
         # A first row is capped rather than dropped: an answer that says nothing is worse
         # than one that says little.
         if used + size > budget:
@@ -700,7 +701,7 @@ def _record_tool_failure(tool: str, phase: str, error: object, **extra) -> None:
         pass
 
 
-def _defused_refusal(args: dict, message: str) -> str:
+def _defused_refusal(tool: str, args: dict, message: str) -> str:
     """A dataset refusal quotes export text: an unknown column error names every header, and
     the caller had only seen them defused. Redact and scrub it like a cell, so filtering by a
     scrubbed header cannot hand the original instruction or secret back."""
@@ -708,10 +709,12 @@ def _defused_refusal(args: dict, message: str) -> str:
         conn, cfg = _ctx()
         message, fired = _defuse(cfg, message)
         if fired and isinstance(args.get("name"), str):
-            _flag_injection(conn, cfg, args["name"], fired)   # best effort, like the audit
-    except Exception:                                          # noqa: BLE001
-        # A refusal must not become a traceback; the scrub needs no config.
-        return scrub_injection(message)[0]
+            _flag_injection(conn, cfg, args["name"], fired)
+    except Exception as exc:                                   # noqa: BLE001
+        # A refusal must not become a traceback, and the fallback still fails closed: redact
+        # needs no config, so a secret-shaped header cannot ride out on a broken boundary.
+        _record_tool_failure(tool, "handler", exc)
+        return scrub_injection(redact(message)[0])[0]
     return message
 
 
@@ -734,7 +737,7 @@ def call_tool(name: str, args: dict):
         if isinstance(exc, EXPECTED_ERRORS):
             message = str(exc.args[0]) if isinstance(exc, KeyError) and exc.args else str(exc)
             if name in DATASET_TOOLS:
-                message = _defused_refusal(args, message)
+                message = _defused_refusal(name, args, message)
             _record_tool_failure(name, "result", message)
             return {"error": message}
         _record_tool_failure(name, "handler", exc)

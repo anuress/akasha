@@ -957,6 +957,44 @@ def test_unreadable_stored_settings_warn_when_replaced(env, tmp_path):
     assert [w for w in again["warnings"] if w.startswith("settings replaced")] == []
 
 
+def test_get_and_query_stay_within_ceiling_across_a_sweep_of_budgets(
+        env, tmp_path, monkeypatch):
+    """Dropping fields and adding the marker that says so both change the response, so a row
+    that fits just before `withheld_fields` lands must not be returned over the ceiling."""
+    names = [f"{'n' * 40}{i}" for i in range(8)]
+    cells = ",".join(["v"] * 9)                # item plus the eight named columns
+    _dataset(env, tmp_path, rows=",".join(["item", *names])
+                                      + f"\nbolt,{cells}\nbolt2,{cells}\n")
+
+    for ceiling in range(300, 1010, 5):
+        monkeypatch.setattr(mcp_server, "MAX_FEED_RESPONSE_CHARS", ceiling)
+        row = call_tool("knowledge_feed_get", {"name": "prices", "locator": "row:2"})
+        queried = call_tool("knowledge_feed_query", {"name": "prices"})
+        for response in (row, queried):
+            text = json.dumps(response, separators=(",", ":"))
+            assert len(text) <= ceiling, (ceiling, response)
+
+
+def test_refusal_fallback_still_redacts_and_records_the_failure(env, tmp_path,
+                                                              monkeypatch):
+    """The fallback runs when the boundary itself fails: a secret-shaped header must still
+    be redacted, and a response that needed it has to leave a trace a caller can find."""
+    conn, cfg = env
+    secret = "abcdefghijklmnopqrstuvwxyz123456"
+    _dataset(env, tmp_path, rows=f"item,authorization: bearer {secret}\nbolt,x\n")
+
+    def broken(cfg, text):
+        raise RuntimeError("scrub unavailable")
+
+    monkeypatch.setattr(mcp_server, "_defuse", broken)
+    out = call_tool("knowledge_feed_query", {"name": "prices", "where": ["nope=1"]})
+
+    assert secret not in out["error"]
+    assert "[REDACTED:" in out["error"]
+    failed = [e for e in _events(conn, "tool.failed") if e["phase"] == "handler"]
+    assert len(failed) == 1 and "scrub unavailable" in failed[0]["error"]
+
+
 # --- failures reach the caller as messages and the log as events -----------------------
 
 def test_unknown_get_suggests_search_when_id_does_not_exist(env):
