@@ -1380,3 +1380,74 @@ def test_restore_takes_the_recorded_extension_over_a_newer_other_copy(env, sourc
     assert _copy(cfg, suffix=".csv").read_bytes() == copy_bytes
     assert not _copy(cfg, suffix=".xlsx").exists()
     assert newer.exists()
+
+
+def _tombstone_rows(conn):
+    return conn.execute("SELECT key FROM meta WHERE key LIKE 'feed_tombstone:%'").fetchall()
+
+
+def test_lifecycle_survives_a_root_added_between_remove_and_restore(env, source):
+    """The tombstone record is what says what a trashed row was; a document's id depends on
+    today's `[[index]]` roots, so a root added after the removal makes a re-derived id
+    miss, and the restore then puts the dataset back as a plain note outside `datasets/`
+    with its copy left in the trash."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    doc_id = _doc_id(conn, cfg)
+    copy_bytes = _copy(cfg).read_bytes()
+    feed.remove_dataset(conn, cfg, "prices")
+    cfg.index_roots = [IndexRoot(path=str(cfg.knowledge_dir.parent), source="notes")]
+
+    restored = knowledge.restore(conn, cfg, doc_id)
+
+    assert restored == _doc(cfg)
+    assert _copy(cfg).read_bytes() == copy_bytes
+    assert _tombstone_rows(conn) == []
+
+
+def test_lifecycle_survives_a_root_removed_between_remove_and_restore(env, source):
+    """Same in the other direction: a root that covered the knowledge dir while the feed
+    ran is gone again by the time the restore happens."""
+    conn, cfg = env
+    cfg.index_roots = [IndexRoot(path=str(cfg.knowledge_dir.parent), source="notes")]
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    doc_id = _doc_id(conn, cfg)
+    copy_bytes = _copy(cfg).read_bytes()
+    feed.remove_dataset(conn, cfg, "prices")
+    cfg.index_roots = []
+
+    restored = knowledge.restore(conn, cfg, doc_id)
+
+    assert restored == _doc(cfg)
+    assert _copy(cfg).read_bytes() == copy_bytes
+
+
+def test_refeed_after_a_root_change_leaves_no_tombstone(env, source):
+    """A re-feed consumes the tombstone it replaces; looking for the id its own config
+    derives would leave the row and its trashed file behind after a root changed, files no
+    row points at and no purge reaches."""
+    conn, cfg = env
+    settings = FeedSettings(key="item")
+    feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
+    feed.remove_dataset(conn, cfg, "prices")
+    cfg.index_roots = [IndexRoot(path=str(cfg.knowledge_dir.parent), source="notes")]
+
+    feed.feed(conn, cfg, source(rows="item,price\nbolt,9\n"), "prices", settings,
+              repo="sample-repo")
+
+    assert [unit.fields["price"] for unit in feed_store.load_units(conn, "prices")] == ["9"]
+    assert not list((cfg.knowledge_dir.parent / "trash").rglob("*__prices.md"))
+    assert _tombstone_rows(conn) == []
+
+
+def test_purge_forgets_the_tombstone_record(env, source):
+    """`purge` deletes the row, so the record saying what it was has to go with it: a later
+    write must not read a dataset name off an id the database no longer holds."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    feed.remove_dataset(conn, cfg, "prices")
+    assert _tombstone_rows(conn)
+
+    knowledge.purge(conn, cfg)
+
+    assert _tombstone_rows(conn) == []

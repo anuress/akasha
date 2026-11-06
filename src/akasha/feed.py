@@ -306,6 +306,46 @@ def _live_dataset_refusal(name: str, path: Path) -> ValueError:
     return ValueError(f"'{name}' is live at {path}; remove it before restoring this one")
 
 
+def _tombstone_key(doc_id: str) -> str:
+    return f"feed_tombstone:{doc_id}"
+
+
+def _record_tombstone(conn: sqlite3.Connection, doc_id: str, name: str, repo: str) -> None:
+    """Say which dataset the row being tombstoned was, for whoever finds it in the trash.
+
+    Written in the transaction that tombstones the row and removed with it. It is evidence
+    a trashed row cannot carry itself: its path is in the trash, and its id was derived
+    from paths and roots the config may no longer have.
+    """
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                 (_tombstone_key(doc_id), json.dumps({"name": name, "repo": repo})))
+
+
+def _tombstone_record(conn: sqlite3.Connection, doc_id: str) -> tuple[str, str] | None:
+    """The `(name, repo)` `remove_dataset` recorded for a trashed row, or None.
+
+    `knowledge.remove` refuses a dataset document, so a record is the only way a trashed
+    row can claim to be a dataset, and it names one whatever today's roots say.
+    """
+    row = conn.execute("SELECT value FROM meta WHERE key = ?",
+                       (_tombstone_key(doc_id),)).fetchone()
+    if row is None:
+        return None
+    try:
+        data = json.loads(row["value"])
+        name, repo = data["name"], data["repo"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+    if not isinstance(name, str) or not isinstance(repo, str):
+        return None
+    return name, repo
+
+
+def _forget_tombstone(conn: sqlite3.Connection, doc_id: str) -> None:
+    """Drop the record of a tombstone being consumed, so nothing reads a stale one."""
+    conn.execute("DELETE FROM meta WHERE key = ?", (_tombstone_key(doc_id),))
+
+
 def _lock(cfg: Config, name: str) -> IO[str]:
     """One feed of a name at a time.
 
@@ -755,8 +795,9 @@ def remove_dataset(conn: sqlite3.Connection, cfg: Config, name: str) -> tuple[Pa
     """Take a dataset out of the knowledge base, keeping its document and copy in trash.
 
     Returns where each went. The copy leaves first, so a failure before the database part
-    can put it straight back; the unit rows, the cell mapping and the document's tombstone
-    then land in one transaction. `knowledge.restore` and `feed` are what put a name back.
+    can put it straight back; the unit rows, the cell mapping, the record of what the
+    document was and its tombstone then land in one transaction. `knowledge.restore` and
+    `feed` are what put a name back.
     """
     _checked_name(name)
     handle = _lock(cfg, name)
@@ -785,6 +826,7 @@ def remove_dataset(conn: sqlite3.Connection, cfg: Config, name: str) -> tuple[Pa
             conn.execute("BEGIN IMMEDIATE")
             feed_store.drop_dataset(conn, name)
             doc_trash = knowledge._remove_unchecked(conn, cfg, row["id"])
+            _record_tombstone(conn, row["id"], name, repo)
             conn.execute("COMMIT")
         except Exception as exc:                                     # noqa: BLE001
             if conn.in_transaction:
@@ -813,32 +855,29 @@ def _drop_removed_copy(conn: sqlite3.Connection, cfg: Config, name: str,
     its own trash. Returns the trashed files the caller unlinks once it has committed:
     left behind they are files no row points at, which `purge` can never reach.
 
-    A tombstone is this dataset's only when its id is the one the live path derives: a
-    removed note can be moved to the same trash file name and carry the same frontmatter,
-    and dropping that one would delete a document the user can still restore.
+    A tombstone is this dataset's only when `remove_dataset` recorded this name and repo
+    for it: a removed note is never recorded, and re-deriving an id from today's roots
+    would stop recognising a dataset fed under another config.
     """
-    own_path = _dataset_doc_path(cfg, repo, name)
     trash = cfg.knowledge_dir.parent / "trash"
     stale: list[Path] = []
     for row in conn.execute(
-            "SELECT id, path, repo, source FROM documents"
-            " WHERE deleted_at IS NOT NULL").fetchall():
-        own_id = knowledge._expected_id(conn, cfg, own_path, source=row["source"])
-        if row["id"] != own_id:
+            "SELECT id, path FROM documents WHERE deleted_at IS NOT NULL").fetchall():
+        record = _tombstone_record(conn, row["id"])
+        if record != (name, repo):
             continue
         path = Path(row["path"])
-        if path.parent != trash or path.name != f"{own_id}__{name}.md":
+        if path.parent != trash or path.name != f"{row['id']}__{name}.md":
             continue
         if not path.is_file():          # a row whose file is gone is still a tombstone
             continue
         meta, _body = markdown.parse_frontmatter(path.read_text(errors="replace"))
-        if knowledge._trashed_dataset(conn, row, meta, cfg) != name:
-            continue
-        if (meta.get("repo") or "_global") != repo:
+        if knowledge._trashed_dataset(meta, record) is None:
             continue
         conn.execute("DELETE FROM chunks WHERE document_id = ?", (row["id"],))
         conn.execute("DELETE FROM links WHERE from_document_id = ? OR to_document_id = ?",
                      (row["id"], row["id"]))
         conn.execute("DELETE FROM documents WHERE id = ?", (row["id"],))
+        _forget_tombstone(conn, row["id"])
         stale.append(Path(row["path"]))
     return stale

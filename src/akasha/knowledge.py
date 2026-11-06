@@ -133,32 +133,16 @@ def _owning_root(cfg: Config, path: Path):
             return root
     return None
 
-def _index_target(conn: sqlite3.Connection, cfg: Config, path: Path,
-                  source: str | None = None):
-    """The source and root a reindex of `path` uses, or takes from the caller.
+def _index_target(conn: sqlite3.Connection, cfg: Config, path: Path):
+    """The source and root a reindex of `path` uses.
 
     A row already at the path keeps the source it was indexed with; anything else is
-    native. The configured root that contains the path is the other half: both go into the
+    native. The other half is the configured root that contains the path: both go into the
     id a document without a frontmatter `id` derives.
     """
-    if source is None:
-        row = conn.execute("SELECT source FROM documents WHERE path = ?",
-                           (str(path),)).fetchone()
-        source = row["source"] if row else "native"
-    return source, _owning_root(cfg, path)
-
-
-def _expected_id(conn: sqlite3.Connection, cfg: Config, path: Path,
-                 source: str | None = None) -> str:
-    """The id indexing `path` gives it, by the same source and root rule as `_reindex`.
-
-    The dataset lifecycle needs it for a path that no longer exists: a trashed row is that
-    dataset's only if it holds the id its live path would have had.
-    """
-    from akasha.index import derived_id       # index imports this module
-
-    resolved, root = _index_target(conn, cfg, path, source)
-    return derived_id(resolved, path, Path(root.path).expanduser() if root else None)
+    row = conn.execute("SELECT source FROM documents WHERE path = ?",
+                       (str(path),)).fetchone()
+    return (row["source"] if row else "native"), _owning_root(cfg, path)
 
 
 def _require_appendable(row: sqlite3.Row, cfg: Config) -> None:
@@ -647,11 +631,13 @@ def restore(conn: sqlite3.Connection, cfg: Config, doc_id: str) -> Path:
     trashed = Path(row["path"])
     if not trashed.exists():
         raise ValueError(f"{doc_id} has no file in the trash to restore; purge the row instead")
+    # Lazy: feed imports this module.
+    from akasha.feed import _lock, _tombstone_record, _unlock
+
     meta, _body = parse_frontmatter(trashed.read_text(errors="replace"))
-    dataset = _trashed_dataset(conn, row, meta, cfg)
+    dataset = _trashed_dataset(meta, _tombstone_record(conn, doc_id))
     if dataset is None:
         return _restore_locked(conn, cfg, row, trashed, None, meta)
-    from akasha.feed import _lock, _unlock       # feed imports this module
     handle = _lock(cfg, dataset)
     try:
         return _restore_locked(conn, cfg, row, trashed, dataset, meta)
@@ -660,14 +646,14 @@ def restore(conn: sqlite3.Connection, cfg: Config, doc_id: str) -> Path:
 
 def _restore_locked(conn: sqlite3.Connection, cfg: Config, row: sqlite3.Row,
                     trashed: Path, dataset: str | None, meta: dict) -> Path:
+    # Lazy: feed imports this module.
+    from akasha.feed import _dataset_doc, _forget_tombstone, _live_dataset_refusal
+
     doc_id = row["id"]
     copy_back = copy_target = None
     original_name = trashed.name.partition("__")[2] or trashed.name
     folder = cfg.knowledge_dir / (row["repo"] or "_global")
     if dataset is not None:
-        # Lazy: feed imports this module.
-        from akasha.feed import _dataset_doc, _live_dataset_refusal
-
         # Before anything moves: units are keyed by name alone, so a second live dataset
         # of this name would share its rows and the next feed of either would overwrite
         # the other.
@@ -708,6 +694,9 @@ def _restore_locked(conn: sqlite3.Connection, cfg: Config, row: sqlite3.Row,
         conn.execute(
             "UPDATE documents SET deleted_at=NULL, path=?, mtime=NULL, updated_at=? WHERE id=?",
             (str(target), now(), doc_id))
+        # The tombstone is consumed here, so its record goes in the same transaction: a
+        # rollback keeps it for the row that is still in the trash.
+        _forget_tombstone(conn, doc_id)
         conn.commit()
     except Exception as exc:
         # The files were moved outside the transaction, so both go back before the failure
@@ -743,31 +732,29 @@ def _restore_locked(conn: sqlite3.Connection, cfg: Config, row: sqlite3.Row,
             emit(conn, "knowledge.vectors_failed", id=doc_id, error=str(exc))
     return target
 
-def _trashed_dataset(conn: sqlite3.Connection, row: sqlite3.Row, meta: dict,
-                     cfg: Config) -> str | None:
-    """The dataset this trashed row is, or None for any other document.
+def _trashed_dataset(meta: dict, record: tuple[str, str] | None) -> str | None:
+    """The dataset a trashed document was fed as, or None for any other document.
 
-    `feed` writes `kind: dataset`, the name and the repo together, and it is the only
-    writer that does; the path that says the same is gone once the document is in the
-    trash. Frontmatter is not evidence on its own — a note may carry those keys — so the
-    row must also hold the id the live path derives.
+    `remove_dataset` records the name and repo in the transaction that tombstones the row,
+    and `knowledge.remove` refuses a dataset document, so that record is the one thing a
+    note cannot have. The frontmatter stays a second check: `feed` writes `kind: dataset`
+    and the name together, so a document that does not say so is not the recorded one.
     """
+    if record is None:
+        return None
+    name, _repo = record
     if str(meta.get("kind", "")).strip().casefold() != "dataset":
         return None
-    name = meta.get("dataset")
-    if not isinstance(name, str) or not name:
+    if meta.get("dataset") != name:
         return None
     # Lazy: feed imports this module.
-    from akasha.feed import _checked_name, _dataset_doc_path
+    from akasha.feed import _checked_name
 
     try:
         _checked_name(name)
     except ValueError:
         # Not a name `feed` would create, so this is not a fed dataset; `_lock` would also
         # build `files/.locks/<name>.lock` out of a value that may hold `../`.
-        return None
-    live = _dataset_doc_path(cfg, row["repo"] or "_global", name)
-    if _expected_id(conn, cfg, live, source=row["source"]) != row["id"]:
         return None
     return name
 
@@ -805,6 +792,7 @@ def purge(conn: sqlite3.Connection, cfg: Config, older_than_days: int | None = N
     `knowledge.purge_skipped` event.
     """
     from akasha.events import emit
+    from akasha.feed import _forget_tombstone   # feed imports this module
 
     trash = (cfg.knowledge_dir.parent / "trash").resolve()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days or 0)).isoformat()
@@ -825,6 +813,7 @@ def purge(conn: sqlite3.Connection, cfg: Config, older_than_days: int | None = N
         conn.execute("DELETE FROM links WHERE from_document_id = ? OR to_document_id = ?",
                      (row["id"], row["id"]))
         conn.execute("DELETE FROM documents WHERE id = ?", (row["id"],))
+        _forget_tombstone(conn, row["id"])
         purged += 1
     conn.commit()
     return purged + _purge_trashed_copies(cfg, older_than_days)
