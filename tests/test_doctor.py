@@ -610,3 +610,20 @@ def test_a_crashing_attach_check_does_not_hide_the_xlsx_finding(env, tmp_path, m
     unchecked = [f for f in findings if f.kind == "dataset_attach"]
     assert len(unchecked) == 1
     assert "unchecked" in unchecked[0].detail
+
+
+def test_a_crashing_dataset_read_does_not_end_the_dataset_checks(env, monkeypatch):
+    """The read is shared, so its failure is one finding: an exception escaping it would
+    take the dataset section of the report down with it."""
+    conn, cfg, _home = env
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("documents unreadable")
+
+    monkeypatch.setattr(doctor, "dataset_documents", boom)
+
+    findings = doctor._datasets(cfg, conn)
+
+    assert [f.kind for f in findings] == ["datasets"]
+    assert findings[0].severity == "error"
+    assert "unchecked: RuntimeError: documents unreadable" in findings[0].detail

@@ -193,9 +193,11 @@ def dataset_documents(conn: sqlite3.Connection,
     """Every dataset document: id, path, frontmatter, and what a check cannot act on.
 
     A dataset document is `<knowledge_dir>/<repo>/datasets/<name>.md`: the path decides it, not
-    the kind, so a hand-written note saying `kind: dataset` stays a note. `missing` is empty
-    for a document `feed` wrote and names the unusable metadata otherwise, so a damaged
-    document is reported instead of disappearing from every check.
+    the kind, so a hand-written note saying `kind: dataset` stays a note. A document in that
+    folder with no `dataset` key at all is a note the user keeps there: no re-feed could repair
+    it, so it gets no finding. `missing` is empty for a document `feed` wrote and names the
+    unusable metadata otherwise, so a damaged document is reported instead of disappearing
+    from every check.
 
     The metadata checks skip a document with `missing` set: `_datasets` reports it and stops
     there, and `doctor`'s attach check only sees usable ones. The xlsx check needs nothing but
@@ -206,14 +208,19 @@ def dataset_documents(conn: sqlite3.Connection,
     docs: list[tuple[str, Path, dict, list[str]]] = []
     for row in conn.execute(
         "SELECT id, path FROM documents WHERE deleted_at IS NULL"
-        " AND status != 'archived' AND source = 'native' AND path LIKE ?",
-        ("%/datasets/%.md",),     # constant, so a repo name is never a LIKE wildcard
+        " AND status != 'archived' AND source = 'native'"
     ):
-        path = Path(row["path"])
-        if (not path.is_file() or path.parent.name != "datasets"
+        # str(path) writes the platform's separator, and a knowledge dir moves between
+        # platforms, so a stored path may hold either. Reading it with the local separator
+        # alone hides every dataset document on the other platform.
+        path = Path(row["path"].replace("\\", "/"))
+        if (path.suffix.lower() != ".md" or not path.is_file()
+                or path.parent.name != "datasets"
                 or path.parent.parent.parent.resolve() != knowledge):
             continue
         meta, _body = parse_frontmatter(path.read_text(errors="replace"))
+        if "dataset" not in meta:
+            continue             # a note beside the datasets, not a damaged dataset
         docs.append((row["id"], path, meta, _missing_meta(meta)))
     return docs
 

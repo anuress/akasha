@@ -735,17 +735,19 @@ def test_dataset_doc_with_bad_frontmatter_is_reported(env, tmp_path):
                         (result.doc_id,)).fetchone()["c"] > 0
 
 
-def test_copy_of_unreadable_dataset_doc_is_not_called_orphan(env, tmp_path):
+def test_the_copy_of_a_document_with_bad_metadata_is_not_called_orphan(env, tmp_path):
     """The re-feed needs that copy, so the document is the finding, never the file."""
     conn, cfg = env
     result = _dataset(env, tmp_path)
-    _dataset_doc(cfg).write_text("## no frontmatter at all\ncells still answer\n")
+    doc = _dataset_doc(cfg)
+    doc.write_text("".join(line for line in doc.read_text().splitlines(keepends=True)
+                           if not line.startswith(("sha256:", "settings_sha256:"))))
 
     findings = _dataset_findings(conn, cfg)
 
     assert [f.kind for f in findings] == ["dataset_metadata_invalid"]
     assert findings[0].document_id == result.doc_id
-    assert "dataset, file, sha256, settings_sha256" in findings[0].detail
+    assert "sha256, settings_sha256" in findings[0].detail
     assert result.copy.is_file()
 
 
@@ -784,6 +786,49 @@ def test_a_note_with_kind_dataset_outside_the_datasets_folder_is_ignored(env):
     assert _dataset_findings(conn, cfg) == []
 
 
+def test_a_dataset_doc_recorded_with_backslash_paths_is_still_checked(env, tmp_path):
+    """Paths are stored with str(path), so a Windows row holds backslashes; one separator
+    must not hide every dataset document from the checks."""
+    conn, cfg = env
+    result = _dataset(env, tmp_path)
+    conn.execute("UPDATE documents SET path = ? WHERE id = ?",
+                 (str(_dataset_doc(cfg)).replace("/", "\\"), result.doc_id))
+    result.copy.unlink()
+
+    findings = [f for f in _dataset_findings(conn, cfg) if f.kind == "dataset_copy_missing"]
+
+    assert [f.document_id for f in findings] == [result.doc_id]
+
+
+def test_a_plain_note_inside_datasets_is_not_a_broken_dataset(env, tmp_path):
+    """A user may keep notes beside their datasets; without a `dataset` key it is a note,
+    and feeding the original file again could never repair it."""
+    conn, cfg = env
+    _dataset(env, tmp_path)
+    datasets = cfg.knowledge_dir / "sample-repo" / "datasets"
+    (datasets / "shopping.md").write_text(
+        "---\ntitle: Shopping notes\n---\n\nbolt is cheap\n")
+    (datasets / "loose.md").write_text("## no frontmatter at all\nbolt is cheap\n")
+    for note in ("shopping.md", "loose.md"):
+        index_path(conn, cfg, datasets / note, "native", root=cfg.knowledge_dir)
+
+    assert _dataset_findings(conn, cfg) == []
+
+
+def test_a_dataset_key_with_nothing_else_is_still_a_broken_dataset(env, tmp_path):
+    """Only an absent `dataset` key makes a note: a document that kept the key and lost the
+    rest is damaged metadata."""
+    conn, cfg = env
+    result = _dataset(env, tmp_path)
+    _dataset_doc(cfg).write_text("---\ndataset: prices\n---\n\nthe cells are gone\n")
+
+    findings = [f for f in _dataset_findings(conn, cfg) if f.kind == "dataset_metadata_invalid"]
+
+    assert [f.document_id for f in findings] == [result.doc_id]
+    assert "file, sha256, settings_sha256" in findings[0].detail
+    assert result.copy.is_file()
+
+
 def test_a_dataset_doc_without_settings_is_reported(env, tmp_path):
     """Attach cannot re-split the copy without settings, so the document is not usable."""
     conn, cfg = env
@@ -818,7 +863,7 @@ def test_a_damaged_doc_in_one_repo_does_not_exempt_another_repos_copy(env, tmp_p
     """The exemption is per (repo, name): another repo's same-named copy has no owner here."""
     conn, cfg = env
     _dataset(env, tmp_path)
-    _dataset_doc(cfg).write_text("## no frontmatter at all\n")
+    _dataset_doc(cfg).write_text("---\ndataset: prices\n---\n\nthe cells are gone\n")
     other = cfg.knowledge_dir.parent / "files" / "repo-b" / "prices.csv"
     other.parent.mkdir(parents=True)
     other.write_text("item\n1\n", encoding="utf-8")

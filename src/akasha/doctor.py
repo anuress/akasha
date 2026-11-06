@@ -271,9 +271,13 @@ def _xlsx(datasets: list[tuple[str, Path, dict, list[str]]]) -> list[Finding]:
 
 def _datasets(cfg: Config, conn: sqlite3.Connection) -> list[Finding]:
     """The dataset checks over one read, each isolated: one crashing keeps the other's."""
-    docs = dataset_documents(conn, cfg)
-    return _isolated("xlsx", lambda: _xlsx(docs)) + _isolated(
-        "dataset_attach", lambda: _dataset_attach(conn, cfg, [d for d in docs if not d[3]]))
+    def checks() -> list[Finding]:
+        docs = dataset_documents(conn, cfg)
+        return _isolated("xlsx", lambda: _xlsx(docs)) + _isolated(
+            "dataset_attach",
+            lambda: _dataset_attach(conn, cfg, [d for d in docs if not d[3]]))
+
+    return _isolated("datasets", checks)
 
 
 def _isolated(kind: str, run) -> list[Finding]:
