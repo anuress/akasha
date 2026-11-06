@@ -2,12 +2,13 @@ import json
 import re
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 from pathlib import Path
 
 from akasha import install
-from akasha.cli import main
+from akasha.cli import _error_text, main
 
 
 @pytest.fixture
@@ -851,6 +852,29 @@ def test_feed_error_messages_are_redacted(home, tmp_path, capsys):
     captured = capsys.readouterr()
     assert "abcdef1234567890abcdef" not in captured.out + captured.err
     assert "[REDACTED:" in captured.out
+
+
+def test_feed_command_with_malformed_config_prints_one_line(home, capsys):
+    """`_error_text` loaded the config it had just failed on, so a broken config.toml
+    escaped that except clause as a traceback instead of the one line cli.py promises."""
+    (home / ".akasha" / "config.toml").write_text("security = tru\n", encoding="utf-8")
+
+    assert main(["feed", "list"]) == 1
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out + captured.err
+    assert len(captured.out.splitlines()) == 1
+
+
+def test_feed_error_line_is_redacted_when_the_config_cannot_be_loaded(home):
+    """An unreadable config leaves the scan policy unknown, and a secret on the error line
+    matters more than a false positive, so redaction does not depend on the policy there."""
+    (home / ".akasha" / "config.toml").write_text("security = tru\n", encoding="utf-8")
+    args = SimpleNamespace(feed_command="list")
+
+    line = _error_text(args, ValueError("Authorization: Bearer abcdef1234567890abcdef"))
+
+    assert "abcdef1234567890abcdef" not in line
+    assert "[REDACTED:" in line
 
 
 def test_redacted_field_names_do_not_overwrite_each_other(home, tmp_path, capsys):

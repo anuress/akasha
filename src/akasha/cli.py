@@ -709,7 +709,16 @@ def _error_text(args, exc) -> str:
     message = _message(exc)
     if getattr(args, "feed_command", None) is None:
         return message
-    return _scrub(load_config(), message)
+    try:
+        cfg = load_config()
+    except EXPECTED_ERRORS:
+        # An unloadable config is one of these errors, and re-reading it here would raise
+        # out of the handler that prints this line. An unreadable policy is unknown, not
+        # off: a secret on the line matters more than a false positive.
+        from akasha.security import redact
+
+        return redact(message)[0]
+    return _scrub(cfg, message)
 
 
 def build_parser() -> argparse.ArgumentParser:
