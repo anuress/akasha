@@ -773,3 +773,59 @@ def test_an_orphan_is_described_as_unclaimed(env, tmp_path):
 
     assert len(orphans) == 1
     assert orphans[0].detail == f"{stray} is named by no readable dataset document"
+
+
+def test_a_note_with_kind_dataset_outside_the_datasets_folder_is_ignored(env):
+    """The path makes a dataset document; a note that claims the kind is still a note."""
+    conn, cfg = env
+    write(conn, cfg, "Meeting notes", "## A\nordinary prose\n", repo="r", kind="dataset",
+          new_kind=True)
+
+    assert _dataset_findings(conn, cfg) == []
+
+
+def test_a_dataset_doc_without_settings_is_reported(env, tmp_path):
+    """Attach cannot re-split the copy without settings, so the document is not usable."""
+    conn, cfg = env
+    result = _dataset(env, tmp_path)
+    doc = _dataset_doc(cfg)
+    doc.write_text("".join(line for line in doc.read_text().splitlines(keepends=True)
+                           if not line.startswith("settings:")))
+
+    findings = [f for f in _dataset_findings(conn, cfg) if f.kind == "dataset_metadata_invalid"]
+
+    assert len(findings) == 1
+    assert findings[0].document_id == result.doc_id
+    assert "settings" in findings[0].detail
+
+
+def test_a_dataset_doc_with_unreadable_settings_is_reported(env, tmp_path):
+    """A settings value that parses to no object would fail every future attach."""
+    conn, cfg = env
+    result = _dataset(env, tmp_path)
+    doc = _dataset_doc(cfg)
+    doc.write_text("".join("settings: {not json\n" if line.startswith("settings:") else line
+                           for line in doc.read_text().splitlines(keepends=True)))
+
+    findings = [f for f in _dataset_findings(conn, cfg) if f.kind == "dataset_metadata_invalid"]
+
+    assert len(findings) == 1
+    assert findings[0].document_id == result.doc_id
+    assert "settings" in findings[0].detail
+
+
+def test_a_damaged_doc_in_one_repo_does_not_exempt_another_repos_copy(env, tmp_path):
+    """The exemption is per (repo, name): another repo's same-named copy has no owner here."""
+    conn, cfg = env
+    _dataset(env, tmp_path)
+    _dataset_doc(cfg).write_text("## no frontmatter at all\n")
+    other = cfg.knowledge_dir.parent / "files" / "repo-b" / "prices.csv"
+    other.parent.mkdir(parents=True)
+    other.write_text("item\n1\n", encoding="utf-8")
+
+    findings = _dataset_findings(conn, cfg)
+
+    orphans = [f for f in findings if f.kind == "dataset_copy_orphan"]
+    assert len(orphans) == 1
+    assert str(other) in orphans[0].detail
+    assert [f.kind for f in findings if f.kind == "dataset_metadata_invalid"]

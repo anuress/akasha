@@ -219,7 +219,7 @@ def _failures(conn: sqlite3.Connection) -> list[Finding]:
 
 
 def _dataset_attach(conn: sqlite3.Connection, cfg: Config,
-                    datasets: list[tuple[str, dict]]) -> list[Finding]:
+                    datasets: list[tuple[str, Path, dict, list[str]]]) -> list[Finding]:
     """The last attach failure of each dataset whose units are still not its own.
 
     A successful attach stores the state the document asks for, so an event is history once
@@ -239,7 +239,7 @@ def _dataset_attach(conn: sqlite3.Connection, cfg: Config,
         if name and name not in latest:
             latest[name] = str(payload.get("error") or "")
     findings: list[Finding] = []
-    for _doc_id, meta in datasets:
+    for _doc_id, _path, meta, _missing in datasets:
         name = str(meta["dataset"])
         if name not in latest:
             continue
@@ -251,10 +251,14 @@ def _dataset_attach(conn: sqlite3.Connection, cfg: Config,
     return findings
 
 
-def _xlsx(datasets: list[tuple[str, dict]]) -> list[Finding]:
-    """Name the extra only while a dataset needs it; otherwise its absence is not news."""
+def _xlsx(datasets: list[tuple[str, Path, dict, list[str]]]) -> list[Finding]:
+    """Name the extra only while a dataset needs it; otherwise its absence is not news.
+
+    Takes every document that names a copy, damaged metadata included: re-splitting it needs
+    `file` alone, so a report that skipped it would go quiet exactly when it matters.
+    """
     if not any(str(meta.get("file") or "").lower().endswith(".xlsx")
-               for _doc_id, meta in datasets):
+               for _doc_id, _path, meta, _missing in datasets):
         return []
     try:
         import openpyxl  # noqa: F401
@@ -266,9 +270,10 @@ def _xlsx(datasets: list[tuple[str, dict]]) -> list[Finding]:
 
 
 def _datasets(cfg: Config, conn: sqlite3.Connection) -> list[Finding]:
-    """Both dataset checks over one read: parsing every dataset document is the cost."""
-    datasets = dataset_documents(conn)
-    return _xlsx(datasets) + _dataset_attach(conn, cfg, datasets)
+    """The dataset checks over one read, each isolated: one crashing keeps the other's."""
+    docs = dataset_documents(conn, cfg)
+    return _isolated("xlsx", lambda: _xlsx(docs)) + _isolated(
+        "dataset_attach", lambda: _dataset_attach(conn, cfg, [d for d in docs if not d[3]]))
 
 
 def _isolated(kind: str, run) -> list[Finding]:

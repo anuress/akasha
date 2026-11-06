@@ -553,11 +553,60 @@ def test_doctor_reads_the_dataset_documents_once(env, tmp_path, monkeypatch):
     calls: list[int] = []
     real = doctor.dataset_documents
 
-    def counting(conn):
+    def counting(conn, cfg):
         calls.append(1)
-        return real(conn)
+        return real(conn, cfg)
 
     monkeypatch.setattr(doctor, "dataset_documents", counting)
     _run(env)
 
     assert len(calls) == 1
+
+
+def test_an_xlsx_dataset_with_bad_metadata_still_asks_for_the_extra(env, tmp_path, monkeypatch):
+    """A document a rebuild must re-split needs the extra even when another key is broken."""
+    conn, cfg, _home = env
+    openpyxl = pytest.importorskip("openpyxl")
+    workbook = openpyxl.Workbook()
+    for row in (("item", "price"), ("bolt", 4)):
+        workbook.active.append(list(row))
+    source = tmp_path / "prices.xlsx"
+    workbook.save(source)
+    feed.feed(conn, cfg, source, "prices", settings=FeedSettings(key="item"),
+              repo="sample-repo")
+    doc = cfg.knowledge_dir / "sample-repo" / "datasets" / "prices.md"
+    doc.write_text("".join(line for line in doc.read_text().splitlines(keepends=True)
+                           if not line.startswith("sha256:")))
+    monkeypatch.setitem(sys.modules, "openpyxl", None)
+
+    findings = [f for f in _run(env) if f.kind == "xlsx"]
+
+    assert len(findings) == 1
+    assert findings[0].severity == "error"
+    assert "akasha-mcp[xlsx]" in findings[0].detail
+
+
+def test_a_crashing_attach_check_does_not_hide_the_xlsx_finding(env, tmp_path, monkeypatch):
+    """The two dataset checks share a read, not a failure: one crash must not mute the other."""
+    conn, cfg, _home = env
+    openpyxl = pytest.importorskip("openpyxl")
+    workbook = openpyxl.Workbook()
+    for row in (("item", "price"), ("bolt", 4)):
+        workbook.active.append(list(row))
+    source = tmp_path / "prices.xlsx"
+    workbook.save(source)
+    feed.feed(conn, cfg, source, "prices", settings=FeedSettings(key="item"),
+              repo="sample-repo")
+    monkeypatch.setitem(sys.modules, "openpyxl", None)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("attach state unreadable")
+
+    monkeypatch.setattr(doctor, "_dataset_attach", boom)
+
+    findings = _run(env)
+
+    assert len([f for f in findings if f.kind == "xlsx"]) == 1
+    unchecked = [f for f in findings if f.kind == "dataset_attach"]
+    assert len(unchecked) == 1
+    assert "unchecked" in unchecked[0].detail
