@@ -691,11 +691,15 @@ def _restore_locked(conn: sqlite3.Connection, cfg: Config, row: sqlite3.Row,
             os.replace(copy_back, copy_target)
             moved = True
         trashed.unlink()
+        # The row's UPDATE and the record delete land together or not at all: autocommitted
+        # apart, an UPDATE that lands beside a delete that then fails leaves a live row
+        # pointing at the document the failure moved back to the trash, out of reach of
+        # restore, feed and purge. The tombstone is consumed here, so a rollback keeps it
+        # for the row that is still in the trash.
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             "UPDATE documents SET deleted_at=NULL, path=?, mtime=NULL, updated_at=? WHERE id=?",
             (str(target), now(), doc_id))
-        # The tombstone is consumed here, so its record goes in the same transaction: a
-        # rollback keeps it for the row that is still in the trash.
         _forget_tombstone(conn, doc_id)
         conn.commit()
     except Exception as exc:
@@ -808,14 +812,26 @@ def purge(conn: sqlite3.Connection, cfg: Config, older_than_days: int | None = N
         if not path.resolve().is_relative_to(trash):
             emit(conn, "knowledge.purge_skipped", id=row["id"], path=row["path"])
             continue
+        # One transaction per row, and the file only once it has committed: unlinked first,
+        # a file whose delete then failed would be gone with its row still there, and
+        # autocommitted apart the deletes leave a row half deleted beside a cut record.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM chunks WHERE document_id = ?", (row["id"],))
+            conn.execute("DELETE FROM links WHERE from_document_id = ? OR to_document_id = ?",
+                         (row["id"], row["id"]))
+            conn.execute("DELETE FROM documents WHERE id = ?", (row["id"],))
+            _forget_tombstone(conn, row["id"])
+            conn.execute("COMMIT")
+        except Exception as exc:                                     # noqa: BLE001
+            if conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error as failure:
+                    exc.add_note(f"could not roll back: {failure}")
+            raise
         path.unlink(missing_ok=True)
-        conn.execute("DELETE FROM chunks WHERE document_id = ?", (row["id"],))
-        conn.execute("DELETE FROM links WHERE from_document_id = ? OR to_document_id = ?",
-                     (row["id"], row["id"]))
-        conn.execute("DELETE FROM documents WHERE id = ?", (row["id"],))
-        _forget_tombstone(conn, row["id"])
         purged += 1
-    conn.commit()
     return purged + _purge_trashed_copies(cfg, older_than_days)
 
 

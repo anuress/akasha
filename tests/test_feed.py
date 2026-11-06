@@ -1478,3 +1478,71 @@ def test_core_feed_refuses_header_row_below_one(env, source):
     assert not _doc(cfg).exists()
     assert not _copy(cfg).exists()
     assert feed_store.load_units(conn, "prices") == []
+
+
+class _FailingTombstoneDelete:
+    """A connection whose tombstone-record delete fails; every other statement goes through."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def execute(self, sql, *parameters):
+        if (sql.lstrip().upper().startswith("DELETE FROM META")
+                and "feed_tombstone:" in str(parameters)):
+            raise sqlite3.OperationalError("cannot write to the database")
+        return self._conn.execute(sql, *parameters)
+
+
+def test_a_restore_that_fails_after_the_update_leaves_the_row_in_the_trash(env, source):
+    """The row UPDATE and the tombstone-record delete autocommit one at a time, so a record
+    delete failing after the UPDATE landed leaves a live row pointing at the document the
+    failure moved back to the trash: no restore, feed or purge can reach it, and the retry
+    refuses because the row no longer says it is deleted."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    doc_id = _doc_id(conn, cfg)
+    feed.remove_dataset(conn, cfg, "prices")
+
+    with pytest.raises(sqlite3.OperationalError, match="cannot write to the database"):
+        knowledge.restore(_FailingTombstoneDelete(conn), cfg, doc_id)
+
+    row = conn.execute("SELECT deleted_at, path FROM documents WHERE id = ?",
+                       (doc_id,)).fetchone()
+    assert row["deleted_at"], "a failed restore left the row live"
+    assert Path(row["path"]).exists(), "a failed restore lost the trashed document"
+    assert _tombstone_rows(conn), "a failed restore consumed the record"
+    assert conn.in_transaction is False
+
+    assert knowledge.restore(conn, cfg, doc_id) == _doc(cfg)
+    assert _tombstone_rows(conn) == []
+
+
+def test_a_purge_that_fails_keeps_the_row_its_record_and_its_file(env, source):
+    """`purge` deletes the row, its chunks and links and the tombstone record one statement
+    at a time and unlinks the file before any of it, so a failure partway leaves a record of
+    a row that no longer exists and a file nothing points at: the file goes only once the
+    row's delete has committed."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    doc_id = _doc_id(conn, cfg)
+    feed.remove_dataset(conn, cfg, "prices")
+    trashed = Path(conn.execute("SELECT path FROM documents WHERE id = ?",
+                                (doc_id,)).fetchone()["path"])
+
+    with pytest.raises(sqlite3.OperationalError, match="cannot write to the database"):
+        knowledge.purge(_FailingTombstoneDelete(conn), cfg)
+
+    assert conn.execute("SELECT COUNT(*) c FROM documents WHERE id = ?",
+                        (doc_id,)).fetchone()["c"] == 1
+    assert conn.execute("SELECT deleted_at FROM documents WHERE id = ?",
+                        (doc_id,)).fetchone()["deleted_at"]
+    assert trashed.exists()
+    assert _tombstone_rows(conn)
+    assert conn.in_transaction is False
+
+    assert knowledge.purge(conn, cfg) >= 1
+    assert not trashed.exists()
+    assert _tombstone_rows(conn) == []
