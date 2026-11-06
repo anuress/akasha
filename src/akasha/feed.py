@@ -483,7 +483,9 @@ def feed(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
 def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
                  settings: FeedSettings | None, repo: str | None) -> FeedResult:
     if not path.is_file():
-        raise FileNotFoundError(f"{path} does not exist")
+        # With errno and filename set, the MCP boundary can tell this vanished export apart
+        # from a missing copy or staging file, which carries paths and stays infrastructure.
+        raise FileNotFoundError(errno.ENOENT, "does not exist", str(path))
     suffix = path.suffix.lower()
     if suffix not in ALLOWED_SUFFIXES:
         raise ValueError(

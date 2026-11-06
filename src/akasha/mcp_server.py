@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextvars
 import dataclasses
+import itertools
 import json
 import sqlite3
 import sys
@@ -59,6 +60,9 @@ FEED_QUERY_LIMIT = 20
 MAX_FEED_CHANGES = feed_core.CHANGE_LINE_CAP
 # A query answer is a list of rows, so it needs its own ceiling on top of the per-cell one.
 MAX_FEED_RESPONSE_CHARS = 60_000
+# A refusal out of a dataset tool can quote export text (an unknown column names every
+# header), so these tools' error messages cross the same boundary as their output.
+DATASET_TOOLS = frozenset({"knowledge_feed", "knowledge_feed_get", "knowledge_feed_query"})
 
 
 def _cap(text: str, limit: int, offset: int = 0) -> tuple[str, int]:
@@ -364,38 +368,53 @@ def _capped_key(cfg, key: str | None, fired: set[str]) -> tuple[str | None, int]
     return _capped_cell(cfg, key, fired)
 
 
+def _unique_field_name(name: str, taken: set[str]) -> str:
+    """A dict cannot hold one name twice. Defusing two headers can land them on one name —
+    the scrub strips an invisible character between them, and two secrets redact to one
+    placeholder — so the later column is numbered, as the splitter numbers duplicates."""
+    base, number = name, 2
+    while name.casefold() in taken:
+        name = f"{base} ({number})"
+        number += 1
+    taken.add(name.casefold())
+    return name
+
+
 def _unit_json(cfg, unit: Unit, fired: set[str]) -> dict:
     """One row as the caller reads it: every string defused, every long one capped, and
     what was cut said per name. A header, a label and a key are export text too."""
     fields: dict[str, str] = {}
     withheld: dict[str, int] = {}
+    taken: set[str] = set()
     for field, value in unit.fields.items():
-        name = _scrub_out(cfg, field, fired)
+        name = _unique_field_name(_scrub_out(cfg, field, fired), taken)
         fields[name], cut = _capped_cell(cfg, value, fired)
         if cut:
             withheld[name] = cut
     key, key_cut = _capped_key(cfg, unit.key, fired)
     label, label_cut = _capped_cell(cfg, unit.label, fired)
-    for name, cut in (("key", key_cut), ("label", label_cut)):
-        if cut:
-            withheld[name] = cut
     out = {"locator": unit.locator, "key": key, "label": label, "fields": fields}
     if withheld:
         out["withheld_chars"] = withheld
+    # Outside withheld_chars, where a column named `key` or `label` would take the name.
+    if key_cut:
+        out["withheld_key"] = key_cut
+    if label_cut:
+        out["withheld_label"] = label_cut
     return out
 
 
-def _stored_settings(cfg: Config, name: str) -> FeedSettings | None:
-    """The settings the last feed stored, or None when there are none to compare against.
-    A document whose settings cannot be read counts as none: feed() reports an invalid
-    dataset, and refusing here would block the repair re-feed that fixes it."""
+def _stored_settings(cfg: Config, name: str) -> tuple[FeedSettings | None, bool]:
+    """The settings the last feed stored, and whether an unreadable document counted as none.
+    Unreadable still counts as none, because feed() reports an invalid dataset and refusing
+    here would block the repair re-feed that fixes it; the replace is said out loud."""
     path = feed_core._dataset_doc(cfg, name)
     if path is None:
-        return None
+        return None, False
     try:
-        return feed_core._settings_from(read_frontmatter(path.read_text())[0], name)
+        return feed_core._settings_from(read_frontmatter(path.read_text())[0], name), False
     except (ValueError, OSError):
-        return None
+        return None, True
 
 
 def _settings_replaced(old: FeedSettings, new: FeedSettings) -> list[str]:
@@ -425,6 +444,16 @@ def _change_json(cfg, identity: str, label: str, fields, fired: set[str]) -> dic
             "fields": [_scrub_out(cfg, field, fired) for field in sorted(fields)]}
 
 
+def _change_rows(diff) -> list[tuple]:
+    """The diff as the report's rows, added then removed then changed, stopping at the cap
+    without building the rest: a large re-feed can change thousands of rows."""
+    rows = itertools.chain(
+        ((_identity(u), u.label, u.fields) for u in diff.added),
+        ((_identity(u), u.label, u.fields) for u in diff.removed),
+        ((c.identity, c.label, c.fields) for c in diff.changed))
+    return list(itertools.islice(rows, MAX_FEED_CHANGES))
+
+
 def _identity(unit: Unit) -> str:
     return f"key:{unit.key}" if unit.key is not None else unit.locator
 
@@ -440,7 +469,8 @@ def _knowledge_feed(args: dict):
         raise ValueError(f"{path} does not exist")
     # A key must exist before the first feed writes anything, and a re-feed that replaces
     # the settings has to say so; both read the dataset this name would land on.
-    stored = _stored_settings(cfg, name) if settings is not None else None
+    stored, unreadable = ((None, False) if settings is None
+                          else _stored_settings(cfg, name))
     _refuse_first_feed_without_key(cfg, name, settings)
     # feed() owns repo resolution for the CLI and here alike, `*` refusal included.
     try:
@@ -452,22 +482,19 @@ def _knowledge_feed(args: dict):
             raise
         message = f"{path.name} vanished before it could be fed; retry the feed"
         raise ValueError(message) from None
-    if settings is not None and stored is not None:
-        replaced = _settings_replaced(stored, settings)
+    if settings is not None:
+        replaced = _settings_replaced(stored, settings) if stored is not None else []
         if replaced:
             result.warnings.append(f"settings replaced: {', '.join(replaced)}")
+        elif unreadable:
+            result.warnings.append("stored settings were unreadable and were replaced")
     if not result.unchanged:
         _written(conn, "knowledge_feed", result.doc_id, dataset=name)
     diff = result.diff
     fired: set[str] = set()
-    changes: list[dict] = []
-    if diff is not None:
-        changes = ([_change_json(cfg, _identity(u), u.label, u.fields, fired)
-                    for u in diff.added]
-                   + [_change_json(cfg, _identity(u), u.label, u.fields, fired)
-                      for u in diff.removed]
-                   + [_change_json(cfg, c.identity, c.label, c.fields, fired)
-                      for c in diff.changed])
+    changes = ([_change_json(cfg, *row, fired) for row in _change_rows(diff)]
+               if diff is not None else [])
+    counts = (len(diff.added), len(diff.removed), len(diff.changed)) if diff else (0, 0, 0)
     renamed = [[_scrub_out(cfg, old, fired), _scrub_out(cfg, new, fired)]
                for old, new in result.renamed]
     warnings = [_scrub_out(cfg, warning, fired) for warning in result.warnings]
@@ -475,11 +502,9 @@ def _knowledge_feed(args: dict):
     return {
         "name": result.name, "repo": result.repo, "doc_id": result.doc_id,
         "copy": str(result.copy), "units": result.units, "unchanged": result.unchanged,
-        "added": len(diff.added) if diff else 0,
-        "removed": len(diff.removed) if diff else 0,
-        "changed": len(diff.changed) if diff else 0,
-        "changes": changes[:MAX_FEED_CHANGES],
-        "withheld": max(len(changes) - MAX_FEED_CHANGES, 0),
+        "added": counts[0], "removed": counts[1], "changed": counts[2],
+        "changes": changes,
+        "withheld": max(sum(counts) - len(changes), 0),
         "renamed": renamed, "warnings": warnings,
         "redacted": result.redacted,
     }
@@ -491,22 +516,36 @@ def _knowledge_feed_get(args: dict):
     fired: set[str] = set()
     row = _unit_json(cfg, feed_core.get_unit(conn, name, args["locator"]), fired)
     _flag_injection(conn, cfg, name, fired)
-    return row
+    return _shrink_to(row, MAX_FEED_RESPONSE_CHARS)
 
 
 def _shrink_to(item: dict, budget: int) -> dict:
-    """Cut a row's cells in order until it fits the ceiling, recording what went. Only a
+    """Make one row fit the ceiling: cut its cells in order, then drop whole fields when even
+    empty ones overflow (a header name is a dict key, not a value) and count them. Only a
     pathological row gets here: one cell per field, each already at the cell cap."""
     for name in list(item["fields"]):
         excess = len(_json(item)) - budget
         if excess <= 0:
-            break
+            return item
         value = item["fields"][name]
         keep = max(len(value) - excess, 0)
         item["fields"][name] = value[:keep]
-        item.setdefault("withheld_chars", {})
-        item["withheld_chars"][name] = (item["withheld_chars"].get(name, 0)
-                                        + len(value) - keep)
+        if keep < len(value):
+            item.setdefault("withheld_chars", {})
+            item["withheld_chars"][name] = (item["withheld_chars"].get(name, 0)
+                                            + len(value) - keep)
+    dropped = 0
+    # Reversed, so the columns cut first are the ones kept when any can stay.
+    for name in reversed(list(item["fields"])):
+        if len(_json(item)) <= budget:
+            break
+        del item["fields"][name]
+        item.get("withheld_chars", {}).pop(name, None)
+        dropped += 1
+    if dropped:
+        item["withheld_fields"] = dropped
+        if not item.get("withheld_chars"):
+            item.pop("withheld_chars", None)
     return item
 
 
@@ -661,6 +700,21 @@ def _record_tool_failure(tool: str, phase: str, error: object, **extra) -> None:
         pass
 
 
+def _defused_refusal(args: dict, message: str) -> str:
+    """A dataset refusal quotes export text: an unknown column error names every header, and
+    the caller had only seen them defused. Redact and scrub it like a cell, so filtering by a
+    scrubbed header cannot hand the original instruction or secret back."""
+    try:
+        conn, cfg = _ctx()
+        message, fired = _defuse(cfg, message)
+        if fired and isinstance(args.get("name"), str):
+            _flag_injection(conn, cfg, args["name"], fired)   # best effort, like the audit
+    except Exception:                                          # noqa: BLE001
+        # A refusal must not become a traceback; the scrub needs no config.
+        return scrub_injection(message)[0]
+    return message
+
+
 def _is_infrastructure(exc: Exception) -> bool:
     """Disk, database or schema trouble: not something the caller can fix, and its message
     carries paths. An OSError without an errno is a refusal of ours, not the OS's."""
@@ -679,6 +733,8 @@ def call_tool(name: str, args: dict):
             return {"error": f"{name} failed ({type(exc).__name__}); run akasha doctor"}
         if isinstance(exc, EXPECTED_ERRORS):
             message = str(exc.args[0]) if isinstance(exc, KeyError) and exc.args else str(exc)
+            if name in DATASET_TOOLS:
+                message = _defused_refusal(args, message)
             _record_tool_failure(name, "result", message)
             return {"error": message}
         _record_tool_failure(name, "handler", exc)
