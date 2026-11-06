@@ -1514,6 +1514,9 @@ def test_a_restore_that_fails_after_the_update_leaves_the_row_in_the_trash(env, 
     assert row["deleted_at"], "a failed restore left the row live"
     assert Path(row["path"]).exists(), "a failed restore lost the trashed document"
     assert _tombstone_rows(conn), "a failed restore consumed the record"
+    assert not _copy(cfg).exists(), "a failed restore left the copy where the feed put it"
+    assert feed.trashed_copies(cfg, "sample-repo", "prices"), (
+        "a failed restore lost the trashed copy")
     assert conn.in_transaction is False
 
     assert knowledge.restore(conn, cfg, doc_id) == _doc(cfg)
@@ -1531,12 +1534,23 @@ def test_a_purge_that_fails_keeps_the_row_its_record_and_its_file(env, source):
     feed.remove_dataset(conn, cfg, "prices")
     trashed = Path(conn.execute("SELECT path FROM documents WHERE id = ?",
                                 (doc_id,)).fetchone()["path"])
+    # One chunk and one self-link: the row's own derived data, which a failed purge must not
+    # take away either.
+    conn.execute("INSERT INTO chunks (id, document_id, heading, body, ord)"
+                 " VALUES ('ch_purge', ?, 'A', 'a chunk of a trashed dataset', 0)", (doc_id,))
+    conn.execute("INSERT INTO links (id, from_document_id, to_document_id, to_ref, kind,"
+                 " created_at) VALUES ('ln_purge', ?, ?, NULL, 'references', ?)",
+                 (doc_id, doc_id, "2026-01-01T00:00:00+00:00"))
 
     with pytest.raises(sqlite3.OperationalError, match="cannot write to the database"):
         knowledge.purge(_FailingTombstoneDelete(conn), cfg)
 
     assert conn.execute("SELECT COUNT(*) c FROM documents WHERE id = ?",
                         (doc_id,)).fetchone()["c"] == 1
+    assert conn.execute("SELECT COUNT(*) c FROM chunks WHERE document_id = ?",
+                        (doc_id,)).fetchone()["c"] == 1
+    assert conn.execute("SELECT COUNT(*) c FROM links WHERE from_document_id = ?"
+                        " OR to_document_id = ?", (doc_id, doc_id)).fetchone()["c"] == 1
     assert conn.execute("SELECT deleted_at FROM documents WHERE id = ?",
                         (doc_id,)).fetchone()["deleted_at"]
     assert trashed.exists()
@@ -1545,4 +1559,38 @@ def test_a_purge_that_fails_keeps_the_row_its_record_and_its_file(env, source):
 
     assert knowledge.purge(conn, cfg) >= 1
     assert not trashed.exists()
+    assert _tombstone_rows(conn) == []
+    assert conn.execute("SELECT COUNT(*) c FROM chunks WHERE document_id = ?",
+                        (doc_id,)).fetchone()["c"] == 0
+    assert conn.execute("SELECT COUNT(*) c FROM links WHERE from_document_id = ?"
+                        " OR to_document_id = ?", (doc_id, doc_id)).fetchone()["c"] == 0
+
+
+def test_purge_names_the_file_it_could_not_unlink(env, source, monkeypatch):
+    """The row and its record are committed before the file goes, so a file the unlink
+    refuses stays in the trash with nothing pointing at it: the failure has to name that
+    file, or the only way to find it is to read the trash."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    doc_id = _doc_id(conn, cfg)
+    feed.remove_dataset(conn, cfg, "prices")
+    trashed = Path(conn.execute("SELECT path FROM documents WHERE id = ?",
+                                (doc_id,)).fetchone()["path"])
+    real_unlink = Path.unlink
+
+    def refusing_unlink(self, missing_ok=False):
+        if self == trashed:
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", refusing_unlink)
+
+    with pytest.raises(PermissionError) as failed:
+        knowledge.purge(conn, cfg)
+
+    notes = getattr(failed.value, "__notes__", [])
+    assert any(str(trashed) in note for note in notes), "the leftover file is not named"
+    assert trashed.exists()
+    assert conn.execute("SELECT COUNT(*) c FROM documents WHERE id = ?",
+                        (doc_id,)).fetchone()["c"] == 0
     assert _tombstone_rows(conn) == []

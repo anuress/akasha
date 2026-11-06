@@ -830,7 +830,13 @@ def purge(conn: sqlite3.Connection, cfg: Config, older_than_days: int | None = N
                 except sqlite3.Error as failure:
                     exc.add_note(f"could not roll back: {failure}")
             raise
-        path.unlink(missing_ok=True)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            # The row and its record are already committed, so this note is the only record
+            # of the file the trash still holds.
+            exc.add_note(f"row {row['id']} is purged; its file remains at {path}")
+            raise
         purged += 1
     return purged + _purge_trashed_copies(cfg, older_than_days)
 
