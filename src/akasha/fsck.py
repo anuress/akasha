@@ -190,14 +190,14 @@ def _missing_meta(meta: dict) -> list[str]:
 
 def dataset_documents(conn: sqlite3.Connection,
                       cfg: Config) -> list[tuple[str, Path, dict, list[str]]]:
-    """Every dataset document: id, path, frontmatter, and what a check cannot act on.
+    """The native documents of a repo's `datasets` folder: id, path, frontmatter, and what
+    a check cannot act on.
 
-    A dataset document is `<knowledge_dir>/<repo>/datasets/<name>.md`: the path decides it, not
-    the kind, so a hand-written note saying `kind: dataset` stays a note. A document in that
-    folder with no `dataset` key at all is a note the user keeps there: no re-feed could repair
-    it, so it gets no finding. `missing` is empty for a document `feed` wrote and names the
-    unusable metadata otherwise, so a damaged document is reported instead of disappearing
-    from every check.
+    The path decides what a dataset document is, not the kind, so a hand-written note saying
+    `kind: dataset` stays a note. A document in the folder with no `dataset` key at all is a
+    note the user keeps there: `_datasets` reports nothing for it, but its copy is still not
+    an orphan. `missing` is empty for a document `feed` wrote and names the unusable metadata
+    otherwise, so a damaged document is reported instead of disappearing from every check.
 
     The metadata checks skip a document with `missing` set: `_datasets` reports it and stops
     there, and `doctor`'s attach check only sees usable ones. The xlsx check needs nothing but
@@ -210,17 +210,17 @@ def dataset_documents(conn: sqlite3.Connection,
         "SELECT id, path FROM documents WHERE deleted_at IS NULL"
         " AND status != 'archived' AND source = 'native'"
     ):
-        # str(path) writes the platform's separator, and a knowledge dir moves between
-        # platforms, so a stored path may hold either. Reading it with the local separator
-        # alone hides every dataset document on the other platform.
-        path = Path(row["path"].replace("\\", "/"))
-        if (path.suffix.lower() != ".md" or not path.is_file()
-                or path.parent.name != "datasets"
-                or path.parent.parent.parent.resolve() != knowledge):
+        path = Path(row["path"])
+        if "\\" in row["path"] and "/" not in row["path"] and not path.is_file():
+            # Written where the separator is `\`: this platform reads the whole string as
+            # one name. Only when the row as stored is no file, so a real backslash in a
+            # POSIX name is left alone.
+            path = Path(row["path"].replace("\\", "/"))
+        if (path.suffix.lower() != ".md" or path.parent.name != "datasets"
+                or path.parent.parent.parent.resolve() != knowledge
+                or not path.is_file()):
             continue
         meta, _body = parse_frontmatter(path.read_text(errors="replace"))
-        if "dataset" not in meta:
-            continue             # a note beside the datasets, not a damaged dataset
         docs.append((row["id"], path, meta, _missing_meta(meta)))
     return docs
 
@@ -232,8 +232,8 @@ def _leftovers(cfg: Config, named: set[Path],
     One level under `files/<repo>/`. `.trash` holds what a replaced copy became and `.locks`
     the feed locks, so both are deliberate. A staging or backup file is reported as a
     leftover rather than an orphan: it needs deleting, not identifying. A copy whose name
-    matches a dataset document nobody could read is not an orphan either: that document is
-    the finding, and the copy is what a re-feed is checked against.
+    matches a document without usable metadata — damaged frontmatter or a note — is not an
+    orphan either: the copy is what a re-feed reads.
     """
     files_dir = cfg.knowledge_dir.parent / "files"
     if not files_dir.is_dir():
@@ -263,7 +263,8 @@ def _datasets(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:
     """Dataset documents whose copy, or whose units, no longer match the promise.
 
     The frontmatter is the promise: `sha256` and `settings_sha256` are what a rebuild reads
-    the cells from, so a copy that is gone or edited leaves cells nothing explains.
+    the cells from, so a copy that is gone or edited leaves cells nothing explains. A document
+    with no `dataset` key is a note kept there and gets no finding.
     """
     findings: list[Finding] = []
     named: set[Path] = set()
@@ -273,6 +274,11 @@ def _datasets(conn: sqlite3.Connection, cfg: Config) -> list[Finding]:
             # A damaged document still names its copy, and that copy is what a re-feed is read
             # from: calling it an orphan would advise deleting the one file to keep.
             named.add(Path(str(meta["file"])).resolve())
+        if "dataset" not in meta:
+            # A note the user keeps beside the datasets: no finding, but its copy must not
+            # be called an orphan either, since a re-feed of that name reads it.
+            unreadable.add((doc_path.parent.parent.name, doc_path.stem))
+            continue
         if missing:
             unreadable.add((doc_path.parent.parent.name, doc_path.stem))
             findings.append(Finding(

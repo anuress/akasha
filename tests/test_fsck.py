@@ -1,4 +1,5 @@
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
@@ -764,6 +765,16 @@ def test_the_named_copy_of_a_broken_document_is_not_an_orphan(env, tmp_path):
     assert kinds == ["dataset_metadata_invalid"]
 
 
+def test_a_document_with_no_frontmatter_keeps_its_copy_out_of_the_orphan_list(env, tmp_path):
+    """Frontmatter gone, the copy is still what a re-feed reads: deleting it is wrong."""
+    conn, cfg = env
+    result = _dataset(env, tmp_path)
+    _dataset_doc(cfg).write_text("## no frontmatter at all\ncells still answer\n")
+
+    assert _dataset_findings(conn, cfg) == []
+    assert result.copy.is_file()
+
+
 def test_an_orphan_is_described_as_unclaimed(env, tmp_path):
     """Nothing here knows who owns an orphan, so no advice calls it safe to delete."""
     conn, cfg = env
@@ -798,6 +809,22 @@ def test_a_dataset_doc_recorded_with_backslash_paths_is_still_checked(env, tmp_p
     findings = [f for f in _dataset_findings(conn, cfg) if f.kind == "dataset_copy_missing"]
 
     assert [f.document_id for f in findings] == [result.doc_id]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a backslash is a separator there")
+def test_a_backslash_in_a_posix_directory_name_is_not_a_separator(env):
+    """A backslash is legal in a POSIX name; reading it as a separator hides a real dataset."""
+    conn, cfg = env
+    doc = cfg.knowledge_dir / "sample\\repo" / "datasets" / "prices.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text("---\ndataset: prices\nfile: /nowhere/prices.csv\n"
+                   "sha256: " + "a" * 64 + "\nsettings_sha256: " + "b" * 64
+                   + "\nsettings: {\"key\": \"item\"}\n---\n\nitem,price\nbolt,4\n")
+    indexed = index_path(conn, cfg, doc, "native", root=cfg.knowledge_dir)
+
+    findings = [f for f in _dataset_findings(conn, cfg) if f.kind == "dataset_copy_missing"]
+
+    assert [f.document_id for f in findings] == [indexed[0]]
 
 
 def test_a_plain_note_inside_datasets_is_not_a_broken_dataset(env, tmp_path):
