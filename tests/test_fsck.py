@@ -791,9 +791,18 @@ def test_an_orphan_is_described_as_unclaimed(env, tmp_path):
 def test_a_note_with_kind_dataset_outside_the_datasets_folder_is_ignored(env):
     """The path makes a dataset document; a note that claims the kind is still a note."""
     conn, cfg = env
-    write(conn, cfg, "Meeting notes", "## A\nordinary prose\n", repo="r", kind="dataset",
-          new_kind=True)
+    # Written by hand: `knowledge.write` refuses the kind now, and this is the frontmatter
+    # an older akasha or another writer can still leave on disk.
+    cfg.custom_kinds = ["dataset"]          # registered, so the kind survives indexing
+    note = cfg.knowledge_dir / "r" / "meeting-notes.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("---\nid: k_meeting\ntitle: Meeting notes\nrepo: r\nkind: dataset\n"
+                    "status: active\ncreated: 2026-01-01\nupdated: 2026-01-01\n---\n\n"
+                    "## A\nordinary prose\n", encoding="utf-8")
+    index_path(conn, cfg, note, "native", root=None)
 
+    row = conn.execute("SELECT kind FROM documents WHERE path = ?", (str(note),)).fetchone()
+    assert row["kind"] == "dataset", "the fixture must reach the check under test"
     assert _dataset_findings(conn, cfg) == []
 
 
