@@ -14,6 +14,7 @@ import threading
 from collections.abc import Mapping
 from pathlib import Path
 
+from akasha import feed as feed_core
 from akasha import fsck
 from akasha import knowledge as kb
 from akasha import links as lk
@@ -26,6 +27,7 @@ from akasha.features import show as feature_show_core
 from akasha.gitctx import resolve_repo
 from akasha.search import iso_date, link_candidates, search as do_search
 from akasha.security import redact, scrub_injection
+from akasha.splitters import FeedSettings, Unit
 
 
 def _ctx():
@@ -48,6 +50,12 @@ TIMELINE_LIMIT = 15
 # A near-duplicate a few places down the list is common: recall at 15 is noticeably
 # better than at 10 for a few dozen extra tokens.
 FOLD_LIMIT = 15
+
+# A dataset cell is stored and read whole, but one may be megabytes; this is more than any
+# cell worth quoting and still bounded. The change list is capped for the same reason.
+MAX_CELL_CHARS = 4000
+FEED_QUERY_LIMIT = 20
+MAX_FEED_CHANGES = feed_core.CHANGE_LINE_CAP
 
 
 def _cap(text: str, limit: int, offset: int = 0) -> tuple[str, int]:
@@ -288,6 +296,87 @@ def _feature_show(args: dict):
     return feature_show_core(conn, args["slug"])
 
 
+def _feed_settings(name: str, raw) -> FeedSettings | None:
+    """`None` reuses the settings the last feed stored. Anything else is one object keyed
+    by `FeedSettings` fields; an unknown key is refused with the allowed ones named,
+    because a silently ignored setting would feed the wrong columns."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"settings must be an object, got {type(raw).__name__}")
+    allowed = list(FeedSettings.__dataclass_fields__)
+    unknown = sorted(set(raw) - set(allowed))
+    if unknown:
+        raise ValueError(f"unknown settings {', '.join(map(repr, unknown))}; "
+                         f"allowed: {', '.join(allowed)}")
+    # Validated through the stored-settings rule, so the two cannot drift apart.
+    return feed_core._settings_from({"settings": raw}, name)
+
+
+def _unit_json(unit: Unit) -> dict:
+    fields: dict[str, str] = {}
+    withheld: dict[str, int] = {}
+    for field, value in unit.fields.items():
+        fields[field], cut = _cap(value, MAX_CELL_CHARS)
+        if cut:
+            withheld[field] = cut
+    out = {"locator": unit.locator, "key": unit.key, "label": unit.label, "fields": fields}
+    if withheld:
+        out["withheld_chars"] = withheld
+    return out
+
+
+def _change_json(identity: str, label: str, fields) -> dict:
+    return {"identity": identity, "label": label, "fields": sorted(fields)}
+
+
+def _identity(unit: Unit) -> str:
+    return f"key:{unit.key}" if unit.key is not None else unit.locator
+
+
+def _knowledge_feed(args: dict):
+    name = args["name"]
+    settings = _feed_settings(name, args.get("settings"))
+    conn, cfg = _ctx()
+    path = Path(args["path"]).expanduser().resolve()
+    if not path.is_file():
+        # A FileNotFoundError is an OSError, which call_tool reports as infrastructure
+        # trouble; a mistyped path is the caller's to fix.
+        raise ValueError(f"{path} does not exist")
+    # feed() owns repo resolution for the CLI and here alike, `*` refusal included.
+    result = feed_core.feed(conn, cfg, path, name, settings, args.get("repo"))
+    diff = result.diff
+    changes: list[dict] = []
+    if diff is not None:
+        changes = ([_change_json(_identity(u), u.label, u.fields) for u in diff.added]
+                   + [_change_json(_identity(u), u.label, u.fields) for u in diff.removed]
+                   + [_change_json(c.identity, c.label, c.fields) for c in diff.changed])
+    return {
+        "name": result.name, "repo": result.repo, "doc_id": result.doc_id,
+        "copy": str(result.copy), "units": result.units, "unchanged": result.unchanged,
+        "added": len(diff.added) if diff else 0,
+        "removed": len(diff.removed) if diff else 0,
+        "changed": len(diff.changed) if diff else 0,
+        "changes": changes[:MAX_FEED_CHANGES],
+        "withheld": max(len(changes) - MAX_FEED_CHANGES, 0),
+        "renamed": result.renamed, "warnings": result.warnings,
+        "redacted": result.redacted,
+    }
+
+
+def _knowledge_feed_get(args: dict):
+    conn, _ = _ctx()
+    return _unit_json(feed_core.get_unit(conn, args["name"], args["locator"]))
+
+
+def _knowledge_feed_query(args: dict):
+    limit = _at_least(args, "limit", FEED_QUERY_LIMIT)
+    conn, _ = _ctx()
+    units = feed_core.query_units(conn, args["name"], where=args.get("where") or (),
+                                  fields=args.get("fields"), limit=limit)
+    return {"units": [_unit_json(unit) for unit in units]}
+
+
 def doctor_report(findings: list, limit: int = MAX_FINDINGS) -> dict:
     """Degraded and noteworthy findings, errors first so the cap cannot bury them. Healthy
     counts are the report, not the signal."""
@@ -321,6 +410,9 @@ TOOLS = {
     "knowledge_related": _knowledge_related,
     "feature_show": _feature_show,
     "doctor": _doctor,
+    "knowledge_feed": _knowledge_feed,
+    "knowledge_feed_get": _knowledge_feed_get,
+    "knowledge_feed_query": _knowledge_feed_query,
 }
 
 # Written for the agent that reads them in every session: short, and about what to pass.
@@ -358,6 +450,13 @@ DESCRIPTIONS = {
         "defaults to the current checkout; '*' means every repo."),
     "knowledge_related": (
         "Documents linked to this one: citations and backlinks. depth above 1 walks further."),
+    "knowledge_feed": (
+        "feed a .csv/.xlsx export as a searchable dataset; reports changes; first feed "
+        "needs settings.key"),
+    "knowledge_feed_get": (
+        "one dataset row by locator row:N or key:V, as search hits suggest"),
+    "knowledge_feed_query": (
+        "filter dataset rows: where F=v (exact) or F~v (contains)"),
     "feature_show": "How many documents carry a feature.",
     "doctor": (
         "What is degraded about this installation. exit_code 0 means healthy; findings are "
@@ -599,6 +698,23 @@ def build_server():
     @server.tool(description=DESCRIPTIONS["doctor"])
     def doctor(limit: int = MAX_FINDINGS) -> str:
         return _json(call_tool("doctor", {"limit": limit}))
+
+    @server.tool(description=DESCRIPTIONS["knowledge_feed"])
+    def knowledge_feed(path: str, name: str, settings: dict | None = None,
+                       repo: str | None = None) -> str:
+        return _json(call_tool("knowledge_feed", {
+            "path": path, "name": name, "settings": settings, "repo": repo}))
+
+    @server.tool(description=DESCRIPTIONS["knowledge_feed_get"])
+    def knowledge_feed_get(name: str, locator: str) -> str:
+        return _json(call_tool("knowledge_feed_get", {"name": name, "locator": locator}))
+
+    @server.tool(description=DESCRIPTIONS["knowledge_feed_query"])
+    def knowledge_feed_query(name: str, where: list[str] | None = None,
+                             fields: list[str] | None = None,
+                             limit: int = FEED_QUERY_LIMIT) -> str:
+        return _json(call_tool("knowledge_feed_query", {
+            "name": name, "where": where, "fields": fields, "limit": limit}))
 
     # Reaches into the framework's private tool registry; losing it only makes schemas
     # larger, so it degrades instead of stopping the server.

@@ -18,7 +18,8 @@ from akasha.mcp_server import TOOLS, call_tool
 KEPT_TOOLS = {
     "knowledge_search", "knowledge_get", "knowledge_write", "knowledge_update",
     "knowledge_append", "knowledge_archive", "knowledge_fsck", "knowledge_timeline",
-    "knowledge_related", "feature_show", "doctor",
+    "knowledge_related", "feature_show", "doctor", "knowledge_feed",
+    "knowledge_feed_get", "knowledge_feed_query",
 }
 SECRET_DOC = "## Notes\nauthorization: bearer abcdefghijklmnopqrstuvwxyz123456\ndone\n"
 
@@ -65,9 +66,10 @@ def _schema_chars(tool) -> int:
 
 
 def test_the_tool_list_stays_under_its_budget():
-    """Every session that loads the server pays for this list in context."""
+    """Every session that loads the server pays for this list in context. Raised from 5500
+    to 6000 by the user's decision when the three dataset tools landed (measured 5796)."""
     total = sum(_schema_chars(t) for t in _listed())
-    assert total <= 5500, f"tool list is {total} chars"
+    assert total <= 6000, f"tool list is {total} chars"
 
 
 def _title_keywords(node, path=""):
@@ -117,6 +119,9 @@ def test_tools_expose_exactly_the_documented_parameters():
         "knowledge_related": {"depth", "id"},
         "feature_show": {"feature"},
         "doctor": {"limit"},
+        "knowledge_feed": {"name", "path", "repo", "settings"},
+        "knowledge_feed_get": {"locator", "name"},
+        "knowledge_feed_query": {"fields", "limit", "name", "where"},
     }
     assert {t.name: set(t.input_schema["properties"]) for t in _listed()} == documented
 
@@ -534,6 +539,99 @@ def test_doctor_output_is_bounded_and_says_what_was_cut(env, monkeypatch):
     out = call_tool("doctor", {})
     assert len(out["findings"]) == mcp_server.MAX_FINDINGS
     assert out["withheld"] == out["total"] - mcp_server.MAX_FINDINGS > 0
+
+
+# --- datasets -------------------------------------------------------------------------
+
+DATASET_ROWS = "item,note\nbolt,Steel fastener\nnut,Brass fastener\nscrew,steel pin\n"
+FEED_KEYS = {"name", "repo", "doc_id", "copy", "units", "unchanged", "added", "removed",
+             "changed", "changes", "withheld", "renamed", "warnings", "redacted"}
+
+
+def _dataset(env, tmp_path, rows=DATASET_ROWS, name="prices"):
+    """Feed synthetic rows through the tool, the way an agent would."""
+    path = tmp_path / f"{name}.csv"
+    path.write_text(rows, encoding="utf-8")
+    result = call_tool("knowledge_feed", {"path": str(path), "name": name,
+                                         "settings": {"key": "item"},
+                                         "repo": "sample-repo"})
+    assert "error" not in result, result
+    return result
+
+
+def test_knowledge_feed_tool_returns_counts_and_capped_changes(env, tmp_path, monkeypatch):
+    """A re-feed of a large export can change thousands of rows, so the change list is
+    capped and the rest is counted: the caller learns what moved without paying for it."""
+    monkeypatch.setattr(mcp_server, "MAX_FEED_CHANGES", 1)
+    first = _dataset(env, tmp_path)
+
+    assert set(first) == FEED_KEYS
+    assert (first["units"], first["unchanged"], first["repo"]) == (3, False, "sample-repo")
+    assert Path(first["copy"]).is_file()
+    assert first["changes"] == [] and first["withheld"] == 0
+
+    again = _dataset(env, tmp_path, rows="item,note\nbolt,Steel fastener\nnut,Nylon\n"
+                                         "screw,steel pin\npen,ink\n")
+
+    assert (again["added"], again["removed"], again["changed"]) == (1, 0, 1)
+    assert [c["identity"] for c in again["changes"]] == ["key:pen"]
+    assert again["withheld"] == 1
+
+
+def test_knowledge_feed_refuses_denied_unsupported_missing_and_bad_settings_as_messages(
+        env, tmp_path):
+    """Each refusal is something the caller can fix, so it comes back as a message that
+    names the reason instead of an infrastructure error or a traceback."""
+    conn, cfg = env
+    cfg.deny_files = ["denied.csv"]
+    for filename, name, needle in (("denied.csv", "denied", "deny list"),
+                                   ("notes.txt", "notes", "unsupported"),
+                                   ("absent.csv", "absent", "does not exist")):
+        path = tmp_path / filename
+        path.write_text(DATASET_ROWS, encoding="utf-8")   # absent.csv is removed below
+        if filename == "absent.csv":
+            path.unlink()
+        out = call_tool("knowledge_feed", {"path": str(path), "name": name,
+                                          "settings": {"key": "item"},
+                                          "repo": "sample-repo"})
+        assert needle in out["error"], out
+
+    bad = call_tool("knowledge_feed", {"path": str(tmp_path / "denied.csv"),
+                                      "name": "prices",
+                                      "settings": {"key": "item", "colour": "x"},
+                                      "repo": "sample-repo"})
+    assert "colour" in bad["error"] and "key" in bad["error"], bad
+
+
+def test_feed_get_caps_cells_and_reports_withheld(env, tmp_path, monkeypatch):
+    """A cell can be megabytes and a row is fetched to be quoted from, so the cap keeps
+    one under context and says per field how much it cut."""
+    monkeypatch.setattr(mcp_server, "MAX_CELL_CHARS", 10)
+    _dataset(env, tmp_path, rows="item,note\nbolt,Steel fastener\n")
+
+    row = call_tool("knowledge_feed_get", {"name": "prices", "locator": "key:bolt"})
+
+    assert (row["locator"], row["key"], row["label"]) == ("row:2", "bolt", "prices bolt")
+    assert row["fields"] == {"item": "bolt", "note": "Steel fast"}
+    assert row["withheld_chars"] == {"note": 4}
+
+
+def test_feed_query_tool_filters_and_projects(env, tmp_path):
+    """An agent that knows no locator still filters a dataset: rows come back in the same
+    shape as a get, projected to the fields asked for."""
+    _dataset(env, tmp_path)
+
+    out = call_tool("knowledge_feed_query", {"name": "prices", "where": ["note~steel"],
+                                             "fields": ["item"]})
+
+    assert out["units"] == [
+        {"locator": "row:2", "key": "bolt", "label": "prices bolt",
+         "fields": {"item": "bolt"}},
+        {"locator": "row:4", "key": "screw", "label": "prices screw",
+         "fields": {"item": "screw"}},
+    ]
+    limited = call_tool("knowledge_feed_query", {"name": "prices", "limit": 1})
+    assert [u["key"] for u in limited["units"]] == ["bolt"]
 
 
 # --- failures reach the caller as messages and the log as events -----------------------
