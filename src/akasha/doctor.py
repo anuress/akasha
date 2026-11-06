@@ -254,8 +254,9 @@ def _dataset_attach(conn: sqlite3.Connection, cfg: Config,
 def _xlsx(datasets: list[tuple[str, Path, dict, list[str]]]) -> list[Finding]:
     """Name the extra only while a dataset needs it; otherwise its absence is not news.
 
-    Takes every document that names a copy, damaged metadata included: re-splitting it needs
-    `file` alone, so a report that skipped it would go quiet exactly when it matters.
+    Takes every dataset document that names a copy, damaged metadata included: re-splitting
+    it needs `file` alone, so a report that skipped it would go quiet exactly when it
+    matters. A note kept under `datasets/` is never re-split, so it does not count.
     """
     if not any(str(meta.get("file") or "").lower().endswith(".xlsx")
                for _doc_id, _path, meta, _missing in datasets):
@@ -273,7 +274,8 @@ def _datasets(cfg: Config, conn: sqlite3.Connection) -> list[Finding]:
     """The dataset checks over one read, each isolated: one crashing keeps the other's."""
     def checks() -> list[Finding]:
         docs = dataset_documents(conn, cfg)
-        return _isolated("xlsx", lambda: _xlsx(docs)) + _isolated(
+        datasets = [d for d in docs if "dataset" in d[2]]   # a note is never re-split
+        return _isolated("xlsx", lambda: _xlsx(datasets)) + _isolated(
             "dataset_attach",
             lambda: _dataset_attach(conn, cfg, [d for d in docs if not d[3]]))
 

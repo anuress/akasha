@@ -188,6 +188,24 @@ def _missing_meta(meta: dict) -> list[str]:
     return missing
 
 
+def _dataset_doc_path(stored: str, knowledge: Path) -> Path | None:
+    """`stored` when it has the shape of `<knowledge_dir>/<repo>/datasets/<name>.md`.
+
+    Shape only, so a row that cannot be a dataset document costs no stat. A row written on
+    another platform holds that platform's separator, which `Path` here does not split: the
+    row is read as it stands first, and as a `/` path when it holds a backslash and no
+    slash. A real backslash in a POSIX name comes with slashes, so it is read as it stands.
+    """
+    readings = [Path(stored)]
+    if "\\" in stored and "/" not in stored:
+        readings.append(Path(stored.replace("\\", "/")))
+    for path in readings:
+        if (path.suffix.lower() == ".md" and path.parent.name == "datasets"
+                and path.parent.parent.parent.resolve() == knowledge):
+            return path
+    return None
+
+
 def dataset_documents(conn: sqlite3.Connection,
                       cfg: Config) -> list[tuple[str, Path, dict, list[str]]]:
     """The native documents of a repo's `datasets` folder: id, path, frontmatter, and what
@@ -210,15 +228,8 @@ def dataset_documents(conn: sqlite3.Connection,
         "SELECT id, path FROM documents WHERE deleted_at IS NULL"
         " AND status != 'archived' AND source = 'native'"
     ):
-        path = Path(row["path"])
-        if "\\" in row["path"] and "/" not in row["path"] and not path.is_file():
-            # Written where the separator is `\`: this platform reads the whole string as
-            # one name. Only when the row as stored is no file, so a real backslash in a
-            # POSIX name is left alone.
-            path = Path(row["path"].replace("\\", "/"))
-        if (path.suffix.lower() != ".md" or path.parent.name != "datasets"
-                or path.parent.parent.parent.resolve() != knowledge
-                or not path.is_file()):
+        path = _dataset_doc_path(row["path"], knowledge)
+        if path is None or not path.is_file():
             continue
         meta, _body = parse_frontmatter(path.read_text(errors="replace"))
         docs.append((row["id"], path, meta, _missing_meta(meta)))

@@ -8,6 +8,7 @@ from akasha import doctor, feed, install, vectors
 from akasha.config import IndexRoot, load_config
 from akasha.db import connect
 from akasha.events import emit
+from akasha.index import index_path
 from akasha.splitters import FeedSettings
 
 
@@ -475,6 +476,18 @@ def test_an_xlsx_dataset_without_the_extra_is_an_error(env, tmp_path, monkeypatc
     assert findings[0].severity == "error"
     assert "akasha-mcp[xlsx]" in findings[0].detail
     assert doctor.exit_code(_run(env)) == 1
+
+
+def test_a_note_with_an_xlsx_copy_needs_no_extra(env, monkeypatch):
+    """A note kept under datasets/ is never re-split, so its xlsx copy needs no extra."""
+    conn, cfg, _home = env
+    note = cfg.knowledge_dir / "sample-repo" / "datasets" / "prices.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nfile: prices.xlsx\n---\n\nre-export before the next feed\n")
+    index_path(conn, cfg, note, "native", root=cfg.knowledge_dir)
+    monkeypatch.setitem(sys.modules, "openpyxl", None)
+
+    assert "xlsx" not in _kinds(_run(env))
 
 
 def test_a_missing_xlsx_extra_with_no_xlsx_dataset_says_nothing(env, tmp_path, monkeypatch):

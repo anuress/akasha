@@ -7,7 +7,7 @@ import pytest
 from akasha import feed
 from akasha.config import IndexRoot, load_config
 from akasha.db import connect
-from akasha.fsck import MAX_READ_CHARS, check
+from akasha.fsck import MAX_READ_CHARS, check, dataset_documents
 from akasha.index import index_path
 from akasha.markdown import parse_frontmatter
 from akasha.splitters import FeedSettings
@@ -825,6 +825,25 @@ def test_a_backslash_in_a_posix_directory_name_is_not_a_separator(env):
     findings = [f for f in _dataset_findings(conn, cfg) if f.kind == "dataset_copy_missing"]
 
     assert [f.document_id for f in findings] == [indexed[0]]
+
+
+def test_a_row_outside_datasets_is_rejected_by_shape_before_any_stat(env, monkeypatch):
+    """A row that cannot be a dataset document must not cost a stat, whatever separator."""
+    conn, cfg = env
+    doc_id = write(conn, cfg, "Meeting notes", "## A\nordinary prose\n", repo="r")
+    stored = str(cfg.knowledge_dir / "r" / "meeting-notes.md").replace("/", "\\")
+    conn.execute("UPDATE documents SET path = ? WHERE id = ?", (stored, doc_id))
+    calls: list[Path] = []
+    real = Path.is_file
+
+    def counting(self):
+        calls.append(self)
+        return real(self)
+
+    monkeypatch.setattr(Path, "is_file", counting)
+    dataset_documents(conn, cfg)
+
+    assert calls == []
 
 
 def test_a_plain_note_inside_datasets_is_not_a_broken_dataset(env, tmp_path):
