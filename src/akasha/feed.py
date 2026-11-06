@@ -523,25 +523,31 @@ def _checked_name(name: str) -> str:
 
 
 def feed(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
-         settings: FeedSettings | None = None, repo: str | None = None) -> FeedResult:
+         settings: FeedSettings | None = None, repo: str | None = None,
+         line_cap: int = CHANGE_LINE_CAP) -> FeedResult:
     """Copy a table export into the knowledge base and make its cells searchable.
 
     Order matters for crash safety: everything that can refuse the file happens before a
     byte is written, the copy and the document are written outside the transaction (a file
     cannot be rolled back), and the unit rows, the document row and its chunks land in one
     transaction whose failure restores every file it touched.
+
+    `line_cap` bounds each change's diff lines; 0 lists them all. It is a parameter because
+    the diff describes this feed's units, which only exist under the per-name lock: a
+    caller that re-diffed afterwards would be describing another operation.
     """
     path = Path(path)
     _checked_name(name)
     handle = _lock(cfg, name)
     try:
-        return _feed_locked(conn, cfg, path, name, settings, repo)
+        return _feed_locked(conn, cfg, path, name, settings, repo, line_cap)
     finally:
         _unlock(handle)
 
 
 def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
-                 settings: FeedSettings | None, repo: str | None) -> FeedResult:
+                 settings: FeedSettings | None, repo: str | None,
+                 line_cap: int) -> FeedResult:
     if not path.is_file():
         # With errno and filename set, the MCP boundary can tell this vanished export apart
         # from a missing copy or staging file, which carries paths and stays infrastructure.
@@ -572,6 +578,11 @@ def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
         if existing is None:
             raise ValueError(f"first feed of '{name}' needs settings (at least key)")
         settings = _settings_from(previous_meta, name)
+    elif existing is None and settings.key is None:
+        # Under the lock, so this cannot race a feed of the same name: a key is what pairs
+        # a row across imports, and a first feed without one leaves the next import
+        # nothing to compare against.
+        raise ValueError(f"first feed of '{name}' needs settings.key")
 
     copy = _copy_path(cfg, resolved_repo, name, suffix)
     file_sha = hashlib.sha256(data).hexdigest()
@@ -603,7 +614,8 @@ def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
         split_result = splitters.split(staging, name, settings)
         warnings.extend(split_result.warnings)
         units, redacted = redact_units(split_result.units, cfg)
-        changes = feed_store.diff(stored, units) if existing is not None else None
+        changes = (feed_store.diff(stored, units, line_cap=line_cap)
+                   if existing is not None else None)
         if "dataset" not in cfg.custom_kinds:
             # Before the transaction: registering rewrites the config file and commits its
             # event, neither of which a rollback of the dataset could undo.

@@ -596,21 +596,22 @@ def test_feed_add_first_time_without_key_is_one_line_error(home, tmp_path, capsy
 def test_feed_add_refeed_prints_capped_changes_and_full_uncaps(home, tmp_path, capsys):
     """A changed cell can produce hundreds of diff lines, so the listing is capped per
     change and --full asks for the rest instead of flooding the terminal."""
-    source = _csv(tmp_path / "notes.csv", _lines("old", 25))
+    source = _csv(tmp_path / "notes.csv", _lines("old", 40))
     argv = ["feed", "add", source, "--as", "notes", "--repo", "sample-repo", "--key", "id"]
     assert main(argv) == 0
     capsys.readouterr()
 
-    _csv(tmp_path / "notes.csv", _lines("new", 25))
+    _csv(tmp_path / "notes.csv", _lines("new", 40))
     assert main(argv) == 0
     capped = _out(capsys)
     assert "+0 -0 ~1" in capped
     assert "  key:a notes a: text" in capped
-    assert "    text: -old19" in capped and "    text: -old20" not in capped
+    # 80 diff lines, cut at the 50th: everything old and the first ten new ones.
+    assert "    text: +new9" in capped and "    text: +new10" not in capped
 
-    _csv(tmp_path / "notes.csv", _lines("late", 25))
+    _csv(tmp_path / "notes.csv", _lines("late", 40))
     assert main([*argv, "--full"]) == 0
-    assert "    text: +late24" in _out(capsys)
+    assert "    text: +late39" in _out(capsys)
 
 
 def test_feed_add_with_flags_reports_replaced_settings(home, tmp_path, capsys):
@@ -715,3 +716,122 @@ def test_feed_errors_print_one_line_not_traceback(home, tmp_path, capsys):
         out = _out(capsys)
         assert expected in out, argv
         assert len(out.strip().splitlines()) == 1, argv
+
+
+def test_feed_add_full_uses_the_core_uncapped_diff(home, tmp_path, capsys, monkeypatch):
+    """--full must ask the core for an uncapped diff, not re-diff afterwards: the units it
+    diffs only exist under the per-name lock, so a later diff could describe another feed."""
+    from akasha import feed_store as store
+
+    caps: list[int] = []
+    real = store.diff
+
+    def recording(old, new, line_cap=20):
+        caps.append(line_cap)
+        return real(old, new, line_cap)
+
+    monkeypatch.setattr(store, "diff", recording)
+    source = _csv(tmp_path / "notes.csv", _lines("old", 3))
+    argv = ["feed", "add", source, "--as", "notes", "--repo", "sample-repo", "--key", "id"]
+    assert main(argv) == 0
+    assert caps == []  # a first feed has nothing to diff against
+    _csv(tmp_path / "notes.csv", _lines("new", 3))
+    assert main(argv) == 0
+    _csv(tmp_path / "notes.csv", _lines("late", 3))
+    assert main([*argv, "--full"]) == 0
+    assert caps == [50, 0]
+
+
+def test_feed_output_is_redacted_when_scanning_turns_on(home, tmp_path, capsys):
+    """A dataset fed while scanning was off still holds the raw cell, so the policy of the
+    current run has to defuse what get and query print, not what was stored then."""
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    assert main(["config", "set", "security.scan_secrets", "false"]) == 0
+    source = tmp_path / "fruits.csv"
+    source.write_text(f"fruit,colour\napple,{secret}\n", encoding="utf-8")
+    assert main(["feed", "add", str(source), "--as", "fruits", "--repo", "sample-repo",
+                 "--key", "fruit"]) == 0
+    capsys.readouterr()
+    assert main(["feed", "get", "fruits", "row:2"]) == 0
+    assert secret in _out(capsys)  # nothing was scrubbed on the way in
+
+    assert main(["config", "set", "security.scan_secrets", "true"]) == 0
+    capsys.readouterr()
+    assert main(["feed", "get", "fruits", "row:2"]) == 0
+    plain = _out(capsys)
+    assert secret not in plain and "[REDACTED:" in plain
+    assert main(["feed", "get", "fruits", "row:2", "--json"]) == 0
+    assert secret not in _out(capsys)
+    assert main(["feed", "query", "fruits", "--where", "fruit=apple"]) == 0
+    assert secret not in _out(capsys)
+    assert main(["feed", "query", "fruits", "--json"]) == 0
+    assert secret not in _out(capsys)
+
+
+def test_header_row_below_one_is_refused(home, tmp_path, capsys):
+    """Row numbers are 1-based, so 0 or -1 would address a row that holds no headers and
+    feed an export split from the wrong line."""
+    source = tmp_path / "fruits.csv"
+    source.write_text("fruit,colour\napple,red\n", encoding="utf-8")
+    for below in ("0", "-1"):
+        with pytest.raises(SystemExit):
+            main(["feed", "add", str(source), "--as", "fruits", "--repo", "sample-repo",
+                  "--key", "fruit", "--header-row", below])
+        assert "header_row" in capsys.readouterr().err
+
+
+def test_feed_add_warns_when_stored_settings_were_unreadable(home, tmp_path, capsys):
+    """A document whose settings cannot be read is replaced by the flags like any other
+    stored object, and a silent replace is how a key changes without anyone noticing."""
+    source = tmp_path / "fruits.csv"
+    source.write_text("fruit,colour\napple,red\n", encoding="utf-8")
+    assert main(["feed", "add", str(source), "--as", "fruits", "--repo", "sample-repo",
+                 "--key", "fruit"]) == 0
+    capsys.readouterr()
+
+    doc = next((home / ".akasha" / "knowledge").rglob("fruits.md"))
+    doc.write_text(re.sub(r"(?m)^settings: .*$", "settings: not json", doc.read_text()))
+    source.write_text("fruit,colour\napple,green\n", encoding="utf-8")
+    assert main(["feed", "add", str(source), "--as", "fruits", "--repo", "sample-repo",
+                 "--key", "fruit"]) == 0
+    assert "stored settings were unreadable and were replaced" in _out(capsys)
+
+
+def test_feed_add_caps_row_lines_without_full(home, tmp_path, capsys):
+    """A large re-feed can add thousands of rows: without --full the listing stops at 50
+    rows and says how many it hid, or the terminal scrolls the summary away."""
+    rows = "".join(f"fruit{index},colour{index}\n" for index in range(60))
+    for name, extra in (("fruits", []), ("hills", ["--full"])):
+        source = tmp_path / f"{name}.csv"
+        source.write_text("fruit,colour\napple,red\n", encoding="utf-8")
+        argv = ["feed", "add", str(source), "--as", name, "--repo", "sample-repo",
+                "--key", "fruit", *extra]
+        assert main(argv) == 0
+        capsys.readouterr()
+
+        source.write_text("fruit,colour\napple,red\n" + rows, encoding="utf-8")
+        assert main(argv) == 0
+        out = _out(capsys)
+        assert "+60 -0 ~0" in out
+        listed = [line for line in out.splitlines() if line.startswith("  key:")]
+        assert len(listed) == (60 if extra else 50)
+        if extra:
+            assert "more (use --full)" not in out
+        else:
+            assert "10 more (use --full)" in out
+
+
+def test_feed_rm_without_copy_prints_no_copy_line(home, tmp_path, capsys):
+    """A copy deleted behind akasha's back leaves nothing to trash, so printing a path that
+    was never moved would read as a successful move."""
+    source = tmp_path / "fruits.csv"
+    source.write_text("fruit,colour\napple,red\n", encoding="utf-8")
+    assert main(["feed", "add", str(source), "--as", "fruits", "--repo", "sample-repo",
+                 "--key", "fruit"]) == 0
+    next((home / ".akasha" / "files" / "sample-repo").glob("fruits.csv")).unlink()
+    capsys.readouterr()
+
+    assert main(["feed", "rm", "fruits"]) == 0
+    out = _out(capsys)
+    assert "document: " in out and "restore with: akasha knowledge restore " in out
+    assert "copy: " not in out

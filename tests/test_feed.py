@@ -379,9 +379,12 @@ def test_secret_cell_is_redacted_and_counted(env, source):
     the way in, and the count says how much the feed scrubbed."""
     conn, cfg = env
 
+    # The key column is ordinary text: a redacted key falls back to the locator, which
+    # would make this a test of that rule instead of the cell's.
     result = feed.feed(
-        conn, cfg, source(rows="note\nAuthorization: Bearer abcdef1234567890abcdef\n"),
-        "prices", FeedSettings(), repo="sample-repo")
+        conn, cfg,
+        source(rows="item,note\nbolt,Authorization: Bearer abcdef1234567890abcdef\n"),
+        "prices", FeedSettings(key="item"), repo="sample-repo")
 
     assert result.redacted == 1
     assert feed_store.load_units(conn, "prices")[0].fields["note"] == "[REDACTED:bearer]"
@@ -1451,3 +1454,15 @@ def test_purge_forgets_the_tombstone_record(env, source):
     knowledge.purge(conn, cfg)
 
     assert _tombstone_rows(conn) == []
+
+
+def test_first_feed_without_key_is_refused_by_core(env, source):
+    """A key is what pairs a row across imports, so the rule belongs under the per-name lock
+    in core: the CLI and the MCP tool both reach it there, and neither can race it."""
+    conn, cfg = env
+    with pytest.raises(ValueError, match="needs settings.key"):
+        feed.feed(conn, cfg, source(), "prices", FeedSettings(exclude=["price"]),
+                  repo="sample-repo")
+    assert not _doc(cfg).exists()
+    assert not _copy(cfg).exists()
+    assert feed_store.load_units(conn, "prices") == []

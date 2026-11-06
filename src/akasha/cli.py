@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-from akasha import cleanup, feed as feed_core, feed_store, fsck, install, markdown, vectors
+from akasha import cleanup, feed as feed_core, fsck, install, markdown, vectors
 from akasha import knowledge as kb
 from akasha import links as lk
 from akasha.config import load_config
@@ -512,6 +512,14 @@ def cmd_housekeeping(args) -> int:
     return 0
 
 
+def _header_row(text: str) -> int:
+    """A 1-based row number: 0 or less would silently feed a row holding no headers."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"header_row must be 1 or more, got {value}")
+    return value
+
+
 def _selected_settings(args) -> FeedSettings | None:
     """The settings the setting flags describe, or None to reuse what the last feed stored."""
     given = (args.key, args.sheet, args.header_row, args.require, args.exclude, args.label)
@@ -523,69 +531,86 @@ def _selected_settings(args) -> FeedSettings | None:
                         label=args.label)
 
 
-def _replaced_settings(cfg, name: str, settings: FeedSettings) -> list[str]:
-    """Which setting names the flags changed, since a partial object replaces the rest."""
+def _scrub(cfg, text: str) -> str:
+    """The scan policy, applied to output: rows fed while scanning was off sit raw in the
+    table, so feed's lines have to be defused the way `knowledge get` defuses its text."""
+    if not cfg.scan_secrets:
+        return text
+    from akasha.security import redact
+
+    return redact(text)[0]
+
+
+def _replaced_settings(cfg, name: str, settings: FeedSettings) -> tuple[list[str], bool]:
+    """Which setting names the flags changed, and whether the stored ones were unreadable.
+
+    A partial object replaces the rest, key included, which changes how every row is
+    addressed, so neither a replace nor an unreadable predecessor may be silent. Unreadable
+    still counts as none: `feed` reports the invalid dataset, and refusing here would block
+    the repair re-feed that fixes it.
+    """
     doc = feed_core._dataset_doc(cfg, name)
     if doc is None:
-        return []
+        return [], False
     try:
         stored = feed_core._settings_from(markdown.parse_frontmatter(doc.read_text())[0], name)
     except (ValueError, OSError):
-        # An unreadable document is a fault `feed` reports; refusing here would block the
-        # repair re-feed that fixes it.
-        return []
-    return [field.name for field in dataclasses.fields(FeedSettings)
-            if getattr(stored, field.name) != getattr(settings, field.name)]
+        return [], True
+    changed = [field.name for field in dataclasses.fields(FeedSettings)
+               if getattr(stored, field.name) != getattr(settings, field.name)]
+    return changed, False
 
 
 def _identity(unit) -> str:
     return f"key:{unit.key}" if unit.key is not None else unit.locator
 
 
-def _row_line(identity: str, label: str, fields) -> str:
-    names = ", ".join(fields)
-    return f"  {identity} {label}" + (f": {names}" if names else "")
+def _row_line(cfg, identity: str, label: str, fields) -> str:
+    names = ", ".join(_scrub(cfg, name) for name in fields)
+    return f"  {_scrub(cfg, identity)} {_scrub(cfg, label)}" + (f": {names}" if names else "")
 
 
 def cmd_feed_add(args) -> int:
     conn, cfg = _ctx()
     name = args.as_name
     settings = _selected_settings(args)
-    if (settings is not None and settings.key is None
-            and feed_core._dataset_doc(cfg, name) is None):
-        # A key is what pairs a row across imports, so the next feed would have nothing to
-        # compare against; the caller hears it before any dataset exists.
-        raise ValueError(f"first feed of '{name}' needs settings.key")
-    replaced = _replaced_settings(cfg, name, settings) if settings is not None else []
-    # The core caps every change's lines at 20, so --full re-diffs against the units the
-    # feed is about to replace.
-    old = feed_store.load_units(conn, name) if args.full else []
+    # The replace is reported from outside the lock on purpose: a race here can only make
+    # the warning wrong, never the feed. The key rule needs the lock, so it lives in core.
+    replaced, unreadable = (_replaced_settings(cfg, name, settings) if settings is not None
+                            else ([], False))
     result = feed_core.feed(conn, cfg, Path(args.file).expanduser().resolve(), name,
-                            settings, args.repo)
+                            settings, args.repo,
+                            line_cap=0 if args.full else feed_core.CHANGE_LINE_CAP)
     for old_header, new_header in result.renamed:
-        print(f"renamed: {old_header} -> {new_header}")
+        print(f"renamed: {_scrub(cfg, old_header)} -> {_scrub(cfg, new_header)}")
     if replaced:
         print(f"settings replaced: {', '.join(replaced)}")
+    elif unreadable:
+        print("stored settings were unreadable and were replaced")
     for warning in result.warnings:
-        print(warning)
+        print(_scrub(cfg, warning))
     if result.redacted:
         print(f"redacted: {result.redacted}")
-    diff = result.diff
-    if args.full and diff is not None:
-        diff = feed_store.diff(old, feed_store.load_units(conn, name), line_cap=0)
     if result.unchanged:
         print("unchanged")
         return 0
+    diff = result.diff
     if diff is None:
         print(f"first feed: {result.units} units")
         return 0
     print(f"+{len(diff.added)} -{len(diff.removed)} ~{len(diff.changed)}")
-    for unit in diff.added + diff.removed:
-        print(_row_line(_identity(unit), unit.label, sorted(unit.fields)))
-    for change in diff.changed:
-        print(_row_line(change.identity, change.label, change.fields))
-        for line in change.lines:
-            print(f"    {line}")
+    entries = ([(_identity(unit), unit.label, sorted(unit.fields), []) for unit in diff.added]
+               + [(_identity(unit), unit.label, sorted(unit.fields), [])
+                  for unit in diff.removed]
+               + [(change.identity, change.label, change.fields, change.lines)
+                  for change in diff.changed])
+    shown = entries if args.full else entries[:feed_core.CHANGE_LINE_CAP]
+    for identity, label, fields, lines in shown:
+        print(_row_line(cfg, identity, label, fields))
+        for line in lines:
+            print(f"    {_scrub(cfg, line)}")
+    if len(entries) > len(shown):
+        print(f"  … {len(entries) - len(shown)} more (use --full)")
     return 0
 
 
@@ -611,38 +636,49 @@ def cmd_feed_list(args) -> int:
     return 0
 
 
-def _print_unit(unit) -> None:
-    print(f"locator: {unit.locator}")
-    print(f"key: {unit.key or '-'}")
-    print(f"label: {unit.label}")
-    for field, value in unit.fields.items():
+def _unit_row(cfg, unit) -> dict:
+    """One row as it is printed: defused by the scan policy, with the locator as stored
+    because `row:N` is the row, not export data."""
+    return {"locator": unit.locator,
+            "key": _scrub(cfg, unit.key) if unit.key is not None else None,
+            "label": _scrub(cfg, unit.label),
+            "fields": {_scrub(cfg, field): _scrub(cfg, value)
+                       for field, value in unit.fields.items()}}
+
+
+def _print_unit(row: dict) -> None:
+    print(f"locator: {row['locator']}")
+    print(f"key: {row['key'] if row['key'] is not None else '-'}")
+    print(f"label: {row['label']}")
+    for field, value in row["fields"].items():
         print(f"{field}: {value}")
 
 
 def cmd_feed_get(args) -> int:
-    conn, _cfg = _ctx()
-    unit = feed_core.get_unit(conn, args.name, args.locator)
+    conn, cfg = _ctx()
+    row = _unit_row(cfg, feed_core.get_unit(conn, args.name, args.locator))
     if args.json:
-        print(json.dumps(unit._asdict(), indent=2))
+        print(json.dumps(row, indent=2))
         return 0
-    _print_unit(unit)
+    _print_unit(row)
     return 0
 
 
 def cmd_feed_query(args) -> int:
-    conn, _cfg = _ctx()
+    conn, cfg = _ctx()
     fields = [name.strip() for name in args.fields.split(",")] if args.fields else None
     found = feed_core.query_units(conn, args.name, where=args.where or (),
                                   fields=fields, limit=args.limit)
+    rows = [_unit_row(cfg, unit) for unit in found]
     if args.json:
-        print(json.dumps([unit._asdict() for unit in found], indent=2))
+        print(json.dumps(rows, indent=2))
         return 0
-    if not found:
+    if not rows:
         print("no units")
-    for index, unit in enumerate(found):
+    for index, row in enumerate(rows):
         if index:
             print()
-        _print_unit(unit)
+        _print_unit(row)
     return 0
 
 
@@ -650,7 +686,10 @@ def cmd_feed_rm(args) -> int:
     conn, cfg = _ctx()
     doc_trash, copy_trash = feed_core.remove_dataset(conn, cfg, args.name)
     print(f"document: {doc_trash}")
-    print(f"copy: {copy_trash}")
+    if copy_trash.exists():
+        # A copy deleted behind akasha's back leaves nothing to trash, and naming a path
+        # that was never written would read as a successful move.
+        print(f"copy: {copy_trash}")
     # The trash name is `<doc id>__<name>.md`, as `restore` reads it.
     print(f"restore with: akasha knowledge restore {doc_trash.name.partition('__')[0]}")
     return 0
@@ -726,7 +765,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo", help="repo the dataset belongs to; defaults to the current checkout")
     p.add_argument("--key", help="column whose value addresses a row across re-feeds")
     p.add_argument("--sheet", help="xlsx sheet name; defaults to the first sheet")
-    p.add_argument("--header-row", dest="header_row", type=int, metavar="N",
+    p.add_argument("--header-row", dest="header_row", type=_header_row, metavar="N",
                    help="row holding the column headers (default 1)")
     p.add_argument("--require", action="extend", nargs="+", metavar="C",
                    help="keep only rows with a value in this column (repeatable)")
@@ -734,7 +773,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="drop this column from the stored rows (repeatable)")
     p.add_argument("--label", help="row label template, e.g. '{id} {city}'")
     p.add_argument("--full", action="store_true",
-                   help="print every changed-cell line, not the first 20")
+                   help="print every row and change line, not the first 50")
     p.set_defaults(func=cmd_feed_add)
 
     p = fd_sub.add_parser("list", help="the fed datasets, with repo, units, date and copy")
