@@ -316,42 +316,66 @@ def _feed_settings(name: str, raw) -> FeedSettings | None:
     return feed_core._settings_from({"settings": raw}, name)
 
 
-def _scrub_out(conn, cfg, dataset: str, text: str | None) -> str | None:
-    """The read path's injection scrub, as knowledge_get and knowledge_search do it. A fed
-    cell is stored as the export had it and scan_secrets may be off, so this is the only
-    place an instruction-shaped span is defused before an agent reads it."""
+def _defuse(cfg, text: str) -> tuple[str, list[str]]:
+    """Redaction, when the policy is on, then the injection scrub — the order knowledge_get
+    uses. A row fed while scanning was off is still raw in the table, so this boundary is
+    the only thing between it and a caller."""
+    if cfg.scan_secrets:
+        text, _hits = redact(text)
+    return scrub_injection(text)
+
+
+def _scrub_out(cfg, text: str | None, fired: set[str]) -> str | None:
+    """One returned string, defused. Rules collect into `fired` so a whole response records
+    one event instead of one per cell."""
     if not text:
         return text
-    cleaned, fired = scrub_injection(text)
-    if fired:
-        path = feed_core._dataset_doc(cfg, dataset)
-        row = (conn.execute("SELECT id FROM documents WHERE path = ? AND deleted_at IS NULL",
-                            (str(path),)).fetchone() if path else None)
-        emit(conn, "security.injection", dataset=dataset,
-             document=row["id"] if row else None, path=str(path) if path else None,
-             rules=fired)
+    cleaned, rules = _defuse(cfg, text)
+    fired.update(rules)
     return cleaned
 
 
-def _capped_cell(conn, cfg, dataset: str, value: str | None) -> tuple[str | None, int]:
+def _flag_injection(conn, cfg, dataset: str, rules) -> None:
+    if not rules:
+        return
+    path = feed_core._dataset_doc(cfg, dataset)
+    row = (conn.execute("SELECT id FROM documents WHERE path = ? AND deleted_at IS NULL",
+                        (str(path),)).fetchone() if path else None)
+    emit(conn, "security.injection", dataset=dataset,
+         document=row["id"] if row else None, path=str(path) if path else None,
+         rules=sorted(rules))
+
+
+def _capped_cell(cfg, value: str | None, fired: set[str]) -> tuple[str | None, int]:
     """One string, defused before it is cut: a span straddling the boundary would
     otherwise escape the scrub. A missing value stays missing, not empty."""
     if value is None:
         return None, 0
-    return _cap(_scrub_out(conn, cfg, dataset, value), MAX_CELL_CHARS)
+    return _cap(_scrub_out(cfg, value, fired), MAX_CELL_CHARS)
 
 
-def _unit_json(conn, cfg, dataset: str, unit: Unit) -> dict:
+def _capped_key(cfg, key: str | None, fired: set[str]) -> tuple[str | None, int]:
+    """A key the scan policy hides is no longer the identity that pairs a row across
+    imports — the write path drops it for the same reason — so the locator takes over."""
+    if key is None:
+        return None, 0
+    if cfg.scan_secrets and redact(key)[0] != key:
+        return None, 0
+    return _capped_cell(cfg, key, fired)
+
+
+def _unit_json(cfg, unit: Unit, fired: set[str]) -> dict:
     """One row as the caller reads it: every string defused, every long one capped, and
-    what was cut said per name. A label is built from cells, so it is capped too."""
+    what was cut said per name. A header, a label and a key are export text too."""
     fields: dict[str, str] = {}
     withheld: dict[str, int] = {}
     for field, value in unit.fields.items():
-        fields[field], cut = _capped_cell(conn, cfg, dataset, value)
+        name = _scrub_out(cfg, field, fired)
+        fields[name], cut = _capped_cell(cfg, value, fired)
         if cut:
-            withheld[field] = cut
-    key, key_cut = _capped_cell(conn, cfg, dataset, unit.key)
-    label, label_cut = _capped_cell(conn, cfg, dataset, unit.label)
+            withheld[name] = cut
+    key, key_cut = _capped_key(cfg, unit.key, fired)
+    label, label_cut = _capped_cell(cfg, unit.label, fired)
     for name, cut in (("key", key_cut), ("label", label_cut)):
         if cut:
             withheld[name] = cut
@@ -362,11 +386,16 @@ def _unit_json(conn, cfg, dataset: str, unit: Unit) -> dict:
 
 
 def _stored_settings(cfg: Config, name: str) -> FeedSettings | None:
+    """The settings the last feed stored, or None when there are none to compare against.
+    A document whose settings cannot be read counts as none: feed() reports an invalid
+    dataset, and refusing here would block the repair re-feed that fixes it."""
     path = feed_core._dataset_doc(cfg, name)
     if path is None:
         return None
-    meta = read_frontmatter(path.read_text())[0]
-    return feed_core._settings_from(meta, name)
+    try:
+        return feed_core._settings_from(read_frontmatter(path.read_text())[0], name)
+    except (ValueError, OSError):
+        return None
 
 
 def _settings_replaced(old: FeedSettings, new: FeedSettings) -> list[str]:
@@ -380,16 +409,20 @@ def _settings_replaced(old: FeedSettings, new: FeedSettings) -> list[str]:
     return changed
 
 
-def _refuse_first_feed_without_key(name: str, settings: FeedSettings | None,
-                                 stored: FeedSettings | None) -> None:
+def _refuse_first_feed_without_key(cfg: Config, name: str, settings: FeedSettings | None):
     """A key is what pairs a row across imports, so a first feed without one leaves the
     next import nothing to compare against: the caller hears it before a dataset exists."""
-    if settings is not None and settings.key is None and stored is None:
+    if (settings is not None and settings.key is None
+            and feed_core._dataset_doc(cfg, name) is None):
         raise ValueError(f"first feed of '{name}' needs settings.key")
 
 
-def _change_json(identity: str, label: str, fields) -> dict:
-    return {"identity": identity, "label": label, "fields": sorted(fields)}
+def _change_json(cfg, identity: str, label: str, fields, fired: set[str]) -> dict:
+    """One change-log entry. Identity, label and field names all come from the export, so
+    they are defused like a cell before an agent reads the report."""
+    return {"identity": _scrub_out(cfg, identity, fired),
+            "label": _scrub_out(cfg, label, fired),
+            "fields": [_scrub_out(cfg, field, fired) for field in sorted(fields)]}
 
 
 def _identity(unit: Unit) -> str:
@@ -408,14 +441,17 @@ def _knowledge_feed(args: dict):
     # A key must exist before the first feed writes anything, and a re-feed that replaces
     # the settings has to say so; both read the dataset this name would land on.
     stored = _stored_settings(cfg, name) if settings is not None else None
-    _refuse_first_feed_without_key(name, settings, stored)
+    _refuse_first_feed_without_key(cfg, name, settings)
     # feed() owns repo resolution for the CLI and here alike, `*` refusal included.
     try:
         result = feed_core.feed(conn, cfg, path, name, settings, args.get("repo"))
     except FileNotFoundError as exc:
-        # Raised after the path check, so the copy vanished mid-feed; call_tool would call
-        # a bare OSError infrastructure trouble, and this is the caller's to retry.
-        raise ValueError(str(exc)) from None
+        # Only the export vanishing is the caller's to retry. Anything else missing (the
+        # copy, a staging file) is infrastructure trouble, and its message carries paths.
+        if exc.filename != str(path):
+            raise
+        message = f"{path.name} vanished before it could be fed; retry the feed"
+        raise ValueError(message) from None
     if settings is not None and stored is not None:
         replaced = _settings_replaced(stored, settings)
         if replaced:
@@ -423,11 +459,19 @@ def _knowledge_feed(args: dict):
     if not result.unchanged:
         _written(conn, "knowledge_feed", result.doc_id, dataset=name)
     diff = result.diff
+    fired: set[str] = set()
     changes: list[dict] = []
     if diff is not None:
-        changes = ([_change_json(_identity(u), u.label, u.fields) for u in diff.added]
-                   + [_change_json(_identity(u), u.label, u.fields) for u in diff.removed]
-                   + [_change_json(c.identity, c.label, c.fields) for c in diff.changed])
+        changes = ([_change_json(cfg, _identity(u), u.label, u.fields, fired)
+                    for u in diff.added]
+                   + [_change_json(cfg, _identity(u), u.label, u.fields, fired)
+                      for u in diff.removed]
+                   + [_change_json(cfg, c.identity, c.label, c.fields, fired)
+                      for c in diff.changed])
+    renamed = [[_scrub_out(cfg, old, fired), _scrub_out(cfg, new, fired)]
+               for old, new in result.renamed]
+    warnings = [_scrub_out(cfg, warning, fired) for warning in result.warnings]
+    _flag_injection(conn, cfg, name, fired)
     return {
         "name": result.name, "repo": result.repo, "doc_id": result.doc_id,
         "copy": str(result.copy), "units": result.units, "unchanged": result.unchanged,
@@ -436,15 +480,34 @@ def _knowledge_feed(args: dict):
         "changed": len(diff.changed) if diff else 0,
         "changes": changes[:MAX_FEED_CHANGES],
         "withheld": max(len(changes) - MAX_FEED_CHANGES, 0),
-        "renamed": result.renamed, "warnings": result.warnings,
+        "renamed": renamed, "warnings": warnings,
         "redacted": result.redacted,
     }
 
 
 def _knowledge_feed_get(args: dict):
     conn, cfg = _ctx()
-    return _unit_json(conn, cfg, args["name"],
-                      feed_core.get_unit(conn, args["name"], args["locator"]))
+    name = args["name"]
+    fired: set[str] = set()
+    row = _unit_json(cfg, feed_core.get_unit(conn, name, args["locator"]), fired)
+    _flag_injection(conn, cfg, name, fired)
+    return row
+
+
+def _shrink_to(item: dict, budget: int) -> dict:
+    """Cut a row's cells in order until it fits the ceiling, recording what went. Only a
+    pathological row gets here: one cell per field, each already at the cell cap."""
+    for name in list(item["fields"]):
+        excess = len(_json(item)) - budget
+        if excess <= 0:
+            break
+        value = item["fields"][name]
+        keep = max(len(value) - excess, 0)
+        item["fields"][name] = value[:keep]
+        item.setdefault("withheld_chars", {})
+        item["withheld_chars"][name] = (item["withheld_chars"].get(name, 0)
+                                        + len(value) - keep)
+    return item
 
 
 def _knowledge_feed_query(args: dict):
@@ -454,16 +517,23 @@ def _knowledge_feed_query(args: dict):
     found = feed_core.query_units(conn, name, where=args.get("where") or (),
                                  fields=args.get("fields"), limit=limit)
     units: list[dict] = []
+    fired: set[str] = set()
     used = 0
+    # The envelope counts against the ceiling too, or the braces would put it over.
+    budget = MAX_FEED_RESPONSE_CHARS - len(_json({"units": []}))
     for unit in found:
-        item = _unit_json(conn, cfg, name, unit)
+        item = _unit_json(cfg, unit, fired)
         size = len(_json(item))
-        # The first row is kept whatever its size: an answer that says nothing is worse
-        # than an answer that says little.
-        if units and used + size > MAX_FEED_RESPONSE_CHARS:
-            break
+        # A first row is capped rather than dropped: an answer that says nothing is worse
+        # than one that says little.
+        if used + size > budget:
+            if units:
+                break
+            item = _shrink_to(item, budget)
+            size = len(_json(item))
         units.append(item)
         used += size
+    _flag_injection(conn, cfg, name, fired)
     out: dict = {"units": units}
     if len(units) < len(found):
         out["withheld_units"] = len(found) - len(units)
