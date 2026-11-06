@@ -25,6 +25,7 @@ from akasha.db import SchemaMismatch, connect
 from akasha.events import emit
 from akasha.features import show as feature_show_core
 from akasha.gitctx import resolve_repo
+from akasha.markdown import parse_frontmatter as read_frontmatter
 from akasha.search import iso_date, link_candidates, search as do_search
 from akasha.security import redact, scrub_injection
 from akasha.splitters import FeedSettings, Unit
@@ -56,6 +57,8 @@ FOLD_LIMIT = 15
 MAX_CELL_CHARS = 4000
 FEED_QUERY_LIMIT = 20
 MAX_FEED_CHANGES = feed_core.CHANGE_LINE_CAP
+# A query answer is a list of rows, so it needs its own ceiling on top of the per-cell one.
+MAX_FEED_RESPONSE_CHARS = 60_000
 
 
 def _cap(text: str, limit: int, offset: int = 0) -> tuple[str, int]:
@@ -313,17 +316,76 @@ def _feed_settings(name: str, raw) -> FeedSettings | None:
     return feed_core._settings_from({"settings": raw}, name)
 
 
-def _unit_json(unit: Unit) -> dict:
+def _scrub_out(conn, cfg, dataset: str, text: str | None) -> str | None:
+    """The read path's injection scrub, as knowledge_get and knowledge_search do it. A fed
+    cell is stored as the export had it and scan_secrets may be off, so this is the only
+    place an instruction-shaped span is defused before an agent reads it."""
+    if not text:
+        return text
+    cleaned, fired = scrub_injection(text)
+    if fired:
+        path = feed_core._dataset_doc(cfg, dataset)
+        row = (conn.execute("SELECT id FROM documents WHERE path = ? AND deleted_at IS NULL",
+                            (str(path),)).fetchone() if path else None)
+        emit(conn, "security.injection", dataset=dataset,
+             document=row["id"] if row else None, path=str(path) if path else None,
+             rules=fired)
+    return cleaned
+
+
+def _capped_cell(conn, cfg, dataset: str, value: str | None) -> tuple[str | None, int]:
+    """One string, defused before it is cut: a span straddling the boundary would
+    otherwise escape the scrub. A missing value stays missing, not empty."""
+    if value is None:
+        return None, 0
+    return _cap(_scrub_out(conn, cfg, dataset, value), MAX_CELL_CHARS)
+
+
+def _unit_json(conn, cfg, dataset: str, unit: Unit) -> dict:
+    """One row as the caller reads it: every string defused, every long one capped, and
+    what was cut said per name. A label is built from cells, so it is capped too."""
     fields: dict[str, str] = {}
     withheld: dict[str, int] = {}
     for field, value in unit.fields.items():
-        fields[field], cut = _cap(value, MAX_CELL_CHARS)
+        fields[field], cut = _capped_cell(conn, cfg, dataset, value)
         if cut:
             withheld[field] = cut
-    out = {"locator": unit.locator, "key": unit.key, "label": unit.label, "fields": fields}
+    key, key_cut = _capped_cell(conn, cfg, dataset, unit.key)
+    label, label_cut = _capped_cell(conn, cfg, dataset, unit.label)
+    for name, cut in (("key", key_cut), ("label", label_cut)):
+        if cut:
+            withheld[name] = cut
+    out = {"locator": unit.locator, "key": key, "label": label, "fields": fields}
     if withheld:
         out["withheld_chars"] = withheld
     return out
+
+
+def _stored_settings(cfg: Config, name: str) -> FeedSettings | None:
+    path = feed_core._dataset_doc(cfg, name)
+    if path is None:
+        return None
+    meta = read_frontmatter(path.read_text())[0]
+    return feed_core._settings_from(meta, name)
+
+
+def _settings_replaced(old: FeedSettings, new: FeedSettings) -> list[str]:
+    """Which settings a re-feed overwrote. A partial object replaces the rest, key
+    included, and that changes how every row is addressed, so it cannot be silent."""
+    changed = []
+    for field in dataclasses.fields(FeedSettings):
+        before, after = getattr(old, field.name), getattr(new, field.name)
+        if before != after:
+            changed.append(f"{field.name}: {json.dumps(before)} -> {json.dumps(after)}")
+    return changed
+
+
+def _refuse_first_feed_without_key(name: str, settings: FeedSettings | None,
+                                 stored: FeedSettings | None) -> None:
+    """A key is what pairs a row across imports, so a first feed without one leaves the
+    next import nothing to compare against: the caller hears it before a dataset exists."""
+    if settings is not None and settings.key is None and stored is None:
+        raise ValueError(f"first feed of '{name}' needs settings.key")
 
 
 def _change_json(identity: str, label: str, fields) -> dict:
@@ -343,8 +405,23 @@ def _knowledge_feed(args: dict):
         # A FileNotFoundError is an OSError, which call_tool reports as infrastructure
         # trouble; a mistyped path is the caller's to fix.
         raise ValueError(f"{path} does not exist")
+    # A key must exist before the first feed writes anything, and a re-feed that replaces
+    # the settings has to say so; both read the dataset this name would land on.
+    stored = _stored_settings(cfg, name) if settings is not None else None
+    _refuse_first_feed_without_key(name, settings, stored)
     # feed() owns repo resolution for the CLI and here alike, `*` refusal included.
-    result = feed_core.feed(conn, cfg, path, name, settings, args.get("repo"))
+    try:
+        result = feed_core.feed(conn, cfg, path, name, settings, args.get("repo"))
+    except FileNotFoundError as exc:
+        # Raised after the path check, so the copy vanished mid-feed; call_tool would call
+        # a bare OSError infrastructure trouble, and this is the caller's to retry.
+        raise ValueError(str(exc)) from None
+    if settings is not None and stored is not None:
+        replaced = _settings_replaced(stored, settings)
+        if replaced:
+            result.warnings.append(f"settings replaced: {', '.join(replaced)}")
+    if not result.unchanged:
+        _written(conn, "knowledge_feed", result.doc_id, dataset=name)
     diff = result.diff
     changes: list[dict] = []
     if diff is not None:
@@ -365,16 +442,32 @@ def _knowledge_feed(args: dict):
 
 
 def _knowledge_feed_get(args: dict):
-    conn, _ = _ctx()
-    return _unit_json(feed_core.get_unit(conn, args["name"], args["locator"]))
+    conn, cfg = _ctx()
+    return _unit_json(conn, cfg, args["name"],
+                      feed_core.get_unit(conn, args["name"], args["locator"]))
 
 
 def _knowledge_feed_query(args: dict):
     limit = _at_least(args, "limit", FEED_QUERY_LIMIT)
-    conn, _ = _ctx()
-    units = feed_core.query_units(conn, args["name"], where=args.get("where") or (),
-                                  fields=args.get("fields"), limit=limit)
-    return {"units": [_unit_json(unit) for unit in units]}
+    conn, cfg = _ctx()
+    name = args["name"]
+    found = feed_core.query_units(conn, name, where=args.get("where") or (),
+                                 fields=args.get("fields"), limit=limit)
+    units: list[dict] = []
+    used = 0
+    for unit in found:
+        item = _unit_json(conn, cfg, name, unit)
+        size = len(_json(item))
+        # The first row is kept whatever its size: an answer that says nothing is worse
+        # than an answer that says little.
+        if units and used + size > MAX_FEED_RESPONSE_CHARS:
+            break
+        units.append(item)
+        used += size
+    out: dict = {"units": units}
+    if len(units) < len(found):
+        out["withheld_units"] = len(found) - len(units)
+    return out
 
 
 def doctor_report(findings: list, limit: int = MAX_FINDINGS) -> dict:
