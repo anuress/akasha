@@ -1,8 +1,10 @@
 import json
+import re
 import subprocess
 import sys
 
 import pytest
+from pathlib import Path
 
 from akasha import install
 from akasha.cli import main
@@ -552,3 +554,164 @@ def test_init_dry_run_says_which_provider_it_would_choose(isolated_home, monkeyp
     monkeypatch.setattr(vectors, "extra_installed", lambda: True)
     assert main(["init", "--dry-run"]) == 0
     assert "model2vec" in _out(capsys)
+
+
+# --- feed ------------------------------------------------------------------------------
+
+def _csv(path, cell):
+    """One row whose only cell spans several lines, so a changed cell has many diff lines."""
+    path.write_text(f'id,text\na,"{cell}"\n', encoding="utf-8")
+    return str(path)
+
+
+def _lines(prefix, count):
+    return "\n".join(f"{prefix}{index}" for index in range(count))
+
+
+def test_feed_add_first_time_prints_counts_and_renames(home, tmp_path, capsys):
+    """A first feed has no diff to report, so it says what it stored; a renamed header is
+    named because the stored field names are what --key and --where have to use."""
+    source = tmp_path / "fruits.csv"
+    source.write_text("fruit,,note,NOTE\napple,,red,ripe\npear,,green,unripe\n",
+                      encoding="utf-8")
+    assert main(["feed", "add", str(source), "--as", "fruits", "--repo", "sample-repo",
+                 "--key", "fruit"]) == 0
+    out = _out(capsys)
+    assert "first feed: 2 units" in out
+    # The empty header became a name the caller can pass back, and so did the duplicate.
+    assert "renamed:  -> col_B" in out
+    assert "renamed: NOTE -> NOTE (2)" in out
+
+
+def test_feed_add_first_time_without_key_is_one_line_error(home, tmp_path, capsys):
+    """A key is what pairs a row across imports, so a first feed that replaces the
+    settings without one is refused before any dataset exists."""
+    source = tmp_path / "fruits.csv"
+    source.write_text("fruit,colour\napple,red\n", encoding="utf-8")
+    assert main(["feed", "add", str(source), "--as", "fruits", "--repo", "sample-repo",
+                 "--exclude", "colour"]) == 1
+    assert _out(capsys).strip() == "first feed of 'fruits' needs settings.key"
+
+
+def test_feed_add_refeed_prints_capped_changes_and_full_uncaps(home, tmp_path, capsys):
+    """A changed cell can produce hundreds of diff lines, so the listing is capped per
+    change and --full asks for the rest instead of flooding the terminal."""
+    source = _csv(tmp_path / "notes.csv", _lines("old", 25))
+    argv = ["feed", "add", source, "--as", "notes", "--repo", "sample-repo", "--key", "id"]
+    assert main(argv) == 0
+    capsys.readouterr()
+
+    _csv(tmp_path / "notes.csv", _lines("new", 25))
+    assert main(argv) == 0
+    capped = _out(capsys)
+    assert "+0 -0 ~1" in capped
+    assert "  key:a notes a: text" in capped
+    assert "    text: -old19" in capped and "    text: -old20" not in capped
+
+    _csv(tmp_path / "notes.csv", _lines("late", 25))
+    assert main([*argv, "--full"]) == 0
+    assert "    text: +late24" in _out(capsys)
+
+
+def test_feed_add_with_flags_reports_replaced_settings(home, tmp_path, capsys):
+    """Any setting flag replaces the whole stored object, so a re-feed that changes one
+    field has to say which fields now differ or the change is invisible."""
+    source = tmp_path / "fruits.csv"
+    source.write_text("fruit,colour\napple,red\n", encoding="utf-8")
+    first = ["feed", "add", str(source), "--as", "fruits", "--repo", "sample-repo",
+             "--key", "fruit"]
+    assert main(first) == 0
+    assert "settings replaced" not in _out(capsys)
+
+    source.write_text("fruit,colour\napple,green\n", encoding="utf-8")
+    assert main([*first, "--require", "colour"]) == 0
+    assert "settings replaced: require" in _out(capsys)
+
+
+def test_feed_get_and_query_json(home, tmp_path, capsys):
+    """get and query are what a search hit points at, so both return the stored cells:
+    get one row by locator, query filters and projects, and --json is the machine shape."""
+    source = tmp_path / "fruits.csv"
+    source.write_text("fruit,colour\napple,red\npear,green\n", encoding="utf-8")
+    assert main(["feed", "add", str(source), "--as", "fruits", "--repo", "sample-repo",
+                 "--key", "fruit"]) == 0
+    capsys.readouterr()
+
+    assert main(["feed", "get", "fruits", "key:pear", "--json"]) == 0
+    assert json.loads(_out(capsys)) == {"locator": "row:3", "key": "pear",
+                                        "label": "fruits pear",
+                                        "fields": {"fruit": "pear", "colour": "green"}}
+
+    assert main(["feed", "query", "fruits", "--where", "colour~gree", "--json"]) == 0
+    assert [unit["key"] for unit in json.loads(_out(capsys))] == ["pear"]
+
+    assert main(["feed", "get", "fruits", "row:2"]) == 0
+    plain = _out(capsys)
+    assert "locator: row:2" in plain and "colour: red" in plain
+
+    # The caller's spelling is not the export's: matching is case-insensitive.
+    assert main(["feed", "query", "fruits", "--where", "fruit=APPLE",
+                 "--fields", "fruit"]) == 0
+    projected = _out(capsys)
+    assert "locator: row:2" in projected and "colour" not in projected
+
+
+def test_feed_rm_prints_trash_paths_and_restore_hint(home, tmp_path, capsys):
+    """Removal is recoverable, so it names where each half went and the command that
+    brings the document back."""
+    source = tmp_path / "fruits.csv"
+    source.write_text("fruit,colour\napple,red\n", encoding="utf-8")
+    assert main(["feed", "add", str(source), "--as", "fruits", "--repo", "sample-repo",
+                 "--key", "fruit"]) == 0
+    capsys.readouterr()
+
+    assert main(["feed", "rm", "fruits"]) == 0
+    out = _out(capsys)
+    document = next(line for line in out.splitlines() if line.startswith("document: "))
+    copy = next(line for line in out.splitlines() if line.startswith("copy: "))
+    assert "/trash/" in document and "/.trash/" in copy
+    assert re.search(r"fruits-\d{8}T\d{6}\.csv$", copy)  # the stamp orders two copies
+    assert Path(document.split(": ", 1)[1]).is_file()
+    assert re.search(r"restore with: akasha knowledge restore k_\w+", out)
+
+    assert main(["feed", "list"]) == 0
+    assert "no datasets" in _out(capsys)
+
+
+def test_feed_list(home, tmp_path, capsys):
+    """The list is how a caller finds the name to get or query, its unit count and the
+    copy it can open."""
+    assert main(["feed", "list"]) == 0
+    assert "no datasets" in _out(capsys)
+
+    source = tmp_path / "fruits.csv"
+    source.write_text("fruit,colour\napple,red\npear,green\n", encoding="utf-8")
+    assert main(["feed", "add", str(source), "--as", "fruits", "--repo", "sample-repo",
+                 "--key", "fruit"]) == 0
+    capsys.readouterr()
+
+    assert main(["feed", "list"]) == 0
+    out = _out(capsys)
+    assert "fruits" in out and "sample-repo" in out and "2 units" in out
+    assert re.search(r"fed \d{4}-\d{2}-\d{2}", out)
+    assert str(home / ".akasha" / "files" / "sample-repo" / "fruits.csv") in out
+
+
+def test_feed_errors_print_one_line_not_traceback(home, tmp_path, capsys):
+    """A mistyped path, an unsupported file and an unknown dataset are the caller's to
+    fix: one actionable line, never a traceback."""
+    (tmp_path / "notes.txt").write_text("a,b\n1,2\n", encoding="utf-8")
+    cases = [
+        (["feed", "add", str(tmp_path / "gone.csv"), "--as", "fruits", "--repo",
+          "sample-repo", "--key", "fruit"], "does not exist"),
+        (["feed", "add", str(tmp_path / "notes.txt"), "--as", "fruits", "--repo",
+          "sample-repo", "--key", "fruit"], "unsupported file type"),
+        (["feed", "get", "never-fed", "row:1"], "no dataset 'never-fed'"),
+        (["feed", "query", "never-fed"], "no dataset 'never-fed'"),
+        (["feed", "rm", "never-fed"], "no dataset 'never-fed'"),
+    ]
+    for argv, expected in cases:
+        assert main(argv) == 1, argv
+        out = _out(capsys)
+        assert expected in out, argv
+        assert len(out.strip().splitlines()) == 1, argv

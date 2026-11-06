@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-from akasha import cleanup, fsck, install, vectors
+from akasha import cleanup, feed as feed_core, feed_store, fsck, install, markdown, vectors
 from akasha import knowledge as kb
 from akasha import links as lk
 from akasha.config import load_config
@@ -19,6 +19,7 @@ from akasha.features import add_alias, list_features, resolve_feature, show as f
 from akasha.gitctx import git_context, resolve_repo
 from akasha.index import forget, index_all
 from akasha.search import iso_date, search as do_search
+from akasha.splitters import FeedSettings
 
 # Failures a person can act on are printed as one line, never a traceback.
 EXPECTED_ERRORS = (ValueError, KeyError, PermissionError, kb.StaleWrite, kb.ReadOnlySource,
@@ -511,6 +512,150 @@ def cmd_housekeeping(args) -> int:
     return 0
 
 
+def _selected_settings(args) -> FeedSettings | None:
+    """The settings the setting flags describe, or None to reuse what the last feed stored."""
+    given = (args.key, args.sheet, args.header_row, args.require, args.exclude, args.label)
+    if all(value is None for value in given):
+        return None
+    # Any flag replaces the whole stored object: the flags not given take their defaults.
+    return FeedSettings(key=args.key, sheet=args.sheet, header_row=args.header_row or 1,
+                        require=args.require or [], exclude=args.exclude or [],
+                        label=args.label)
+
+
+def _replaced_settings(cfg, name: str, settings: FeedSettings) -> list[str]:
+    """Which setting names the flags changed, since a partial object replaces the rest."""
+    doc = feed_core._dataset_doc(cfg, name)
+    if doc is None:
+        return []
+    try:
+        stored = feed_core._settings_from(markdown.parse_frontmatter(doc.read_text())[0], name)
+    except (ValueError, OSError):
+        # An unreadable document is a fault `feed` reports; refusing here would block the
+        # repair re-feed that fixes it.
+        return []
+    return [field.name for field in dataclasses.fields(FeedSettings)
+            if getattr(stored, field.name) != getattr(settings, field.name)]
+
+
+def _identity(unit) -> str:
+    return f"key:{unit.key}" if unit.key is not None else unit.locator
+
+
+def _row_line(identity: str, label: str, fields) -> str:
+    names = ", ".join(fields)
+    return f"  {identity} {label}" + (f": {names}" if names else "")
+
+
+def cmd_feed_add(args) -> int:
+    conn, cfg = _ctx()
+    name = args.as_name
+    settings = _selected_settings(args)
+    if (settings is not None and settings.key is None
+            and feed_core._dataset_doc(cfg, name) is None):
+        # A key is what pairs a row across imports, so the next feed would have nothing to
+        # compare against; the caller hears it before any dataset exists.
+        raise ValueError(f"first feed of '{name}' needs settings.key")
+    replaced = _replaced_settings(cfg, name, settings) if settings is not None else []
+    # The core caps every change's lines at 20, so --full re-diffs against the units the
+    # feed is about to replace.
+    old = feed_store.load_units(conn, name) if args.full else []
+    result = feed_core.feed(conn, cfg, Path(args.file).expanduser().resolve(), name,
+                            settings, args.repo)
+    for old_header, new_header in result.renamed:
+        print(f"renamed: {old_header} -> {new_header}")
+    if replaced:
+        print(f"settings replaced: {', '.join(replaced)}")
+    for warning in result.warnings:
+        print(warning)
+    if result.redacted:
+        print(f"redacted: {result.redacted}")
+    diff = result.diff
+    if args.full and diff is not None:
+        diff = feed_store.diff(old, feed_store.load_units(conn, name), line_cap=0)
+    if result.unchanged:
+        print("unchanged")
+        return 0
+    if diff is None:
+        print(f"first feed: {result.units} units")
+        return 0
+    print(f"+{len(diff.added)} -{len(diff.removed)} ~{len(diff.changed)}")
+    for unit in diff.added + diff.removed:
+        print(_row_line(_identity(unit), unit.label, sorted(unit.fields)))
+    for change in diff.changed:
+        print(_row_line(change.identity, change.label, change.fields))
+        for line in change.lines:
+            print(f"    {line}")
+    return 0
+
+
+def cmd_feed_list(args) -> int:
+    conn, _cfg = _ctx()
+    rows = conn.execute("SELECT path FROM documents WHERE kind = 'dataset'"
+                        " AND deleted_at IS NULL ORDER BY path").fetchall()
+    if not rows:
+        print("no datasets")
+        return 0
+    for row in rows:
+        path = Path(row["path"])
+        meta, body = markdown.parse_frontmatter(path.read_text())
+        name = meta.get("dataset") or path.stem
+        units = conn.execute("SELECT COUNT(*) AS n FROM feed_units WHERE dataset = ?",
+                             (name,)).fetchone()["n"]
+        # The newest change-log stamp is the last feed's date; `updated_at` moves with
+        # every index run and would not be a feed date. Split on the heading's own line,
+        # so a field named `### x` cannot answer before the log does.
+        fed = body.split("\n### ", 1)[1][:10] if "\n### " in body else "-"
+        print(f"{name}  {meta.get('repo') or '-'}  {units} units  fed {fed}  "
+              f"{meta.get('file')}")
+    return 0
+
+
+def _print_unit(unit) -> None:
+    print(f"locator: {unit.locator}")
+    print(f"key: {unit.key or '-'}")
+    print(f"label: {unit.label}")
+    for field, value in unit.fields.items():
+        print(f"{field}: {value}")
+
+
+def cmd_feed_get(args) -> int:
+    conn, _cfg = _ctx()
+    unit = feed_core.get_unit(conn, args.name, args.locator)
+    if args.json:
+        print(json.dumps(unit._asdict(), indent=2))
+        return 0
+    _print_unit(unit)
+    return 0
+
+
+def cmd_feed_query(args) -> int:
+    conn, _cfg = _ctx()
+    fields = [name.strip() for name in args.fields.split(",")] if args.fields else None
+    found = feed_core.query_units(conn, args.name, where=args.where or (),
+                                  fields=fields, limit=args.limit)
+    if args.json:
+        print(json.dumps([unit._asdict() for unit in found], indent=2))
+        return 0
+    if not found:
+        print("no units")
+    for index, unit in enumerate(found):
+        if index:
+            print()
+        _print_unit(unit)
+    return 0
+
+
+def cmd_feed_rm(args) -> int:
+    conn, cfg = _ctx()
+    doc_trash, copy_trash = feed_core.remove_dataset(conn, cfg, args.name)
+    print(f"document: {doc_trash}")
+    print(f"copy: {copy_trash}")
+    # The trash name is `<doc id>__<name>.md`, as `restore` reads it.
+    print(f"restore with: akasha knowledge restore {doc_trash.name.partition('__')[0]}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="akasha",
@@ -525,6 +670,7 @@ def build_parser() -> argparse.ArgumentParser:
             "destructive, nothing else deletes data:\n"
             "  akasha knowledge rm ID     move a document to trash (recoverable)\n"
             "  akasha knowledge purge     permanently delete trashed documents\n"
+            "  akasha feed rm NAME        move a dataset to trash (recoverable)\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -569,6 +715,50 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--exclude", action="append", default=[],
                    help="skip files matching this glob (repeatable)")
     p.set_defaults(func=cmd_index_add)
+
+    p_feed = sub.add_parser("feed", help="feed a .csv/.xlsx export as a searchable dataset")
+    fd_sub = p_feed.add_subparsers(dest="feed_command", required=True, metavar="command")
+
+    p = fd_sub.add_parser("add", help="feed a file; reports what changed since the last feed")
+    p.add_argument("file", metavar="FILE", help="the .csv or .xlsx export to feed")
+    p.add_argument("--as", dest="as_name", required=True, metavar="NAME",
+                   help="dataset name; feeding it again replaces the stored rows")
+    p.add_argument("--repo", help="repo the dataset belongs to; defaults to the current checkout")
+    p.add_argument("--key", help="column whose value addresses a row across re-feeds")
+    p.add_argument("--sheet", help="xlsx sheet name; defaults to the first sheet")
+    p.add_argument("--header-row", dest="header_row", type=int, metavar="N",
+                   help="row holding the column headers (default 1)")
+    p.add_argument("--require", action="extend", nargs="+", metavar="C",
+                   help="keep only rows with a value in this column (repeatable)")
+    p.add_argument("--exclude", action="extend", nargs="+", metavar="C",
+                   help="drop this column from the stored rows (repeatable)")
+    p.add_argument("--label", help="row label template, e.g. '{id} {city}'")
+    p.add_argument("--full", action="store_true",
+                   help="print every changed-cell line, not the first 20")
+    p.set_defaults(func=cmd_feed_add)
+
+    p = fd_sub.add_parser("list", help="the fed datasets, with repo, units, date and copy")
+    p.set_defaults(func=cmd_feed_list)
+
+    p = fd_sub.add_parser("get", help="print one row, addressed as `row:N` or `key:V`")
+    p.add_argument("name", help="dataset the row belongs to")
+    p.add_argument("locator", metavar="LOCATOR", help="the row to print, e.g. row:2 or key:bolt")
+    p.add_argument("--json", action="store_true", help="print the row as JSON")
+    p.set_defaults(func=cmd_feed_get)
+
+    p = fd_sub.add_parser("query", help="filter rows; every --where item must match")
+    p.add_argument("name", help="dataset to filter")
+    p.add_argument("--where", action="extend", nargs="+", metavar="EXPR",
+                   help="FIELD=VALUE (exact) or FIELD~VALUE (contains), case-insensitive; "
+                        "repeatable, and all must match")
+    p.add_argument("--fields", metavar="F,F", help="comma-separated fields to return")
+    p.add_argument("--limit", type=int, default=20, help="how many rows to return (default 20)")
+    p.add_argument("--json", action="store_true", help="print the rows as JSON")
+    p.set_defaults(func=cmd_feed_query)
+
+    p = fd_sub.add_parser("rm", help="move a dataset's document and copy to trash; recoverable")
+    p.add_argument("name", help="dataset to remove")
+    p.set_defaults(func=cmd_feed_rm)
 
     kb_sub = sub.add_parser("knowledge", help="search, write and maintain the knowledge base"
                             ).add_subparsers(dest="kb_command", required=True, metavar="command")

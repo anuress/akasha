@@ -5,7 +5,8 @@ import pytest
 from akasha.cli import build_parser
 
 KEPT_COMMANDS = {"init", "doctor", "serve", "index", "knowledge", "feature", "hook",
-                 "config", "housekeeping"}
+                 "config", "housekeeping", "feed"}
+KEPT_FEED = {"add", "list", "get", "query", "rm"}
 KEPT_KNOWLEDGE = {"search", "get", "write", "append", "update", "archive", "rm", "restore",
                   "purge", "stale", "stats", "fsck", "related", "timeline"}
 
@@ -49,6 +50,14 @@ def test_help_lists_exactly_the_kept_commands(capsys):
 
 def test_the_knowledge_subcommands_are_exactly_the_kept_ones():
     assert set(_choices(_choices(build_parser())["knowledge"])) == KEPT_KNOWLEDGE
+
+
+def test_the_feed_subcommands_are_exactly_the_kept_ones():
+    assert set(_choices(_choices(build_parser())["feed"])) == KEPT_FEED
+
+
+def test_feed_rm_is_labelled_as_moving_to_the_trash():
+    assert "trash" in _helps(_choices(build_parser())["feed"])["rm"].lower()
 
 
 def test_every_command_and_subcommand_has_help_text():
