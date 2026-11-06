@@ -621,25 +621,34 @@ def restore(conn: sqlite3.Connection, cfg: Config, doc_id: str) -> Path:
     trashed = Path(row["path"])
     if not trashed.exists():
         raise ValueError(f"{doc_id} has no file in the trash to restore; purge the row instead")
-    found = _trashed_dataset(trashed)
-    if found is None:
-        return _restore_locked(conn, cfg, row, trashed, None)
-    dataset = found[0]
+    meta, _body = parse_frontmatter(trashed.read_text(errors="replace"))
+    dataset = _trashed_dataset(row, meta, cfg)
+    if dataset is None:
+        return _restore_locked(conn, cfg, row, trashed, None, meta)
     from akasha.feed import _lock, _unlock       # feed imports this module
     handle = _lock(cfg, dataset)
     try:
-        return _restore_locked(conn, cfg, row, trashed, dataset)
+        return _restore_locked(conn, cfg, row, trashed, dataset, meta)
     finally:
         _unlock(handle)
 
 def _restore_locked(conn: sqlite3.Connection, cfg: Config, row: sqlite3.Row,
-                    trashed: Path, dataset: str | None) -> Path:
+                    trashed: Path, dataset: str | None, meta: dict) -> Path:
     doc_id = row["id"]
     copy_back = copy_target = None
     original_name = trashed.name.partition("__")[2] or trashed.name
     folder = cfg.knowledge_dir / (row["repo"] or "_global")
     if dataset is not None:
-        copy_back, copy_target = _dataset_copy_back(cfg, row, dataset)
+        # Lazy: feed imports this module.
+        from akasha.feed import _dataset_doc, _live_dataset_refusal
+
+        # Before anything moves: units are keyed by name alone, so a second live dataset
+        # of this name would share its rows and the next feed of either would overwrite
+        # the other.
+        live = _dataset_doc(cfg, dataset)
+        if live is not None:
+            raise _live_dataset_refusal(dataset, live)
+        copy_back, copy_target = _dataset_copy_back(cfg, row, dataset, meta.get("file"))
         # A dataset lives in its repo's `datasets/` folder, unlike a document `write` made
         # at the repo root; `feed` always names the file after the dataset.
         original_name = f"{dataset}.md"
@@ -655,6 +664,10 @@ def _restore_locked(conn: sqlite3.Connection, cfg: Config, row: sqlite3.Row,
             os.link(trashed, target)
             break
         except FileExistsError:
+            if dataset is not None:
+                # Never the `-2` fallback: two live documents of one name would share
+                # that name's unit rows.
+                raise _live_dataset_refusal(dataset, target) from None
             target = folder / f"{stem}-{counter}{suffix}"
             counter += 1
     moved = False
@@ -704,36 +717,53 @@ def _restore_locked(conn: sqlite3.Connection, cfg: Config, row: sqlite3.Row,
             emit(conn, "knowledge.vectors_failed", id=doc_id, error=str(exc))
     return target
 
-def _trashed_dataset(trashed: Path) -> tuple[str, str | None] | None:
-    """The dataset a trashed document belongs to and its repo, or None for any other
-    document, as `(name, repo)`.
+def _trashed_dataset(row: sqlite3.Row, meta: dict, cfg: Config) -> str | None:
+    """The dataset this trashed row is, or None for any other document.
 
     `feed` writes `kind: dataset`, the name and the repo together, and it is the only
-    writer that does. The path that says the same is gone once the document is in the
-    trash, so the file is the evidence: a note that merely carries a `dataset:` key was
-    never fed and has no copy to bring back.
+    writer that does; the path that says the same is gone once the document is in the
+    trash. Frontmatter is not evidence on its own — a note may carry those keys — so the
+    row must also hold the id the live path derives.
     """
-    meta, _body = parse_frontmatter(trashed.read_text(errors="replace"))
     if str(meta.get("kind", "")).strip().casefold() != "dataset":
         return None
     name = meta.get("dataset")
     if not isinstance(name, str) or not name:
         return None
-    repo = meta.get("repo")
-    return name, repo if isinstance(repo, str) and repo else None
+    # Lazy: feed imports this module.
+    from akasha.feed import _checked_name, _dataset_doc_path
 
-def _dataset_copy_back(cfg: Config, row: sqlite3.Row, name: str) -> tuple[Path, Path]:
-    """The newest trashed copy of a dataset document, and where it goes back to.
+    try:
+        _checked_name(name)
+    except ValueError:
+        # Not a name `feed` would create, so this is not a fed dataset; `_lock` would also
+        # build `files/.locks/<name>.lock` out of a value that may hold `../`.
+        return None
+    from akasha.index import derived_id
+
+    if derived_id("native",
+                  _dataset_doc_path(cfg, row["repo"] or "_global", name)) != row["id"]:
+        return None
+    return name
+
+def _dataset_copy_back(cfg: Config, row: sqlite3.Row, name: str,
+                       recorded: str | None) -> tuple[Path, Path]:
+    """This document's trashed copy, and where it goes back to.
 
     Resolved before anything moves: a copy that is gone leaves the document in the trash,
     rather than restored without the file its cells are split from, and a live copy at the
     target would be replaced by this one's bytes.
+
+    The doc's `file` picks the copy: an extension switch leaves the old file in the trash
+    beside this one, and a one-second stamp does not always order the two.
     """
     from akasha.feed import _copy_path, trashed_copies   # feed imports this module
 
     if not row["repo"]:
         raise ValueError(f"{row['id']}: no repo, so no dataset copy can be found")
     candidates = trashed_copies(cfg, row["repo"], name)
+    if isinstance(recorded, str) and recorded:
+        candidates = [path for path in candidates if path.suffix == Path(recorded).suffix]
     if not candidates:
         raise ValueError("copy purged; feed the file again with akasha feed add")
     copy_target = _copy_path(cfg, row["repo"], name, candidates[-1].suffix)

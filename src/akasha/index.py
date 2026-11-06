@@ -41,6 +41,21 @@ class IdCollision(ValueError):
     """A derived document id already belongs to a different file."""
 
 
+def derived_id(source: str, path: Path, root: Path | None = None) -> str:
+    """The id a document without a frontmatter `id` gets from where it lives.
+
+    Shared with the dataset lifecycle, which has to recognize a tombstone by the id its
+    live path would have had: the path itself is gone once the row is in the trash.
+    """
+    # The root is part of the key because several roots share a source and can hold files
+    # of the same name. Moving a file or its root changes the id.
+    if root is not None:
+        key = f"{source}:{os.path.abspath(root)}:{path.relative_to(root).as_posix()}"
+    else:
+        key = f"{source}:{path}"
+    return "k_" + hashlib.sha256(key.encode()).hexdigest()[:12]
+
+
 @dataclass
 class IndexStats:
     indexed: int = 0
@@ -145,14 +160,9 @@ def index_path(
     elif meta.get("id"):
         doc_id = meta["id"]
     else:
-        # Derived from where the file lives, so a rebuilt database reproduces the ids that
-        # links name. The root is part of the key because several roots share a source and
-        # can hold files of the same name. Moving a file or its root changes the id.
-        if root is not None:
-            key = f"{source}:{os.path.abspath(root)}:{path.relative_to(root).as_posix()}"
-        else:
-            key = f"{source}:{path}"
-        doc_id = "k_" + hashlib.sha256(key.encode()).hexdigest()[:12]
+        # From where the file lives, so a rebuilt database reproduces the ids that links
+        # name.
+        doc_id = derived_id(source, path, root)
     if not existing:
         clash = conn.execute("SELECT path FROM documents WHERE id = ?", (doc_id,)).fetchone()
         if clash:

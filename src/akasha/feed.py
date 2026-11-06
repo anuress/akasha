@@ -257,23 +257,34 @@ def _trash_path(cfg: Config, repo: str, name: str, suffix: str) -> Path:
 
     Stamped with the moment it was trashed: the stamp orders two copies of one name, and
     `purge` ages a copy by it, since the file itself keeps the mtime of the export it was.
+    The stamp has one-second resolution, so the counter keeps a second copy trashed inside
+    that second from replacing the first.
     """
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    return cfg.knowledge_dir.parent / "files" / ".trash" / repo / f"{name}-{stamp}{suffix}"
+    base = f"{name}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+    folder = cfg.knowledge_dir.parent / "files" / ".trash" / repo
+    counter = 0
+    while True:
+        tail = f"-{counter}" if counter else ""
+        # Both extensions share one counter, so the trash keeps the order of the moves.
+        if all(not (folder / f"{base}{tail}{other}").exists()
+               for other in ALLOWED_SUFFIXES):
+            return folder / f"{base}{tail}{suffix}"
+        counter += 1
 
 
 def trashed_copies(cfg: Config, repo: str, name: str) -> list[Path]:
     """The trashed copies of one dataset, oldest first.
 
     The stamp in the name is what orders them, so the last one is the newest and is what a
-    restore puts back.
+    restore puts back; the counter breaks a tie inside one stamp.
     """
     folder = cfg.knowledge_dir.parent / "files" / ".trash" / repo
     root = folder.resolve()
-    found: list[tuple[str, Path]] = []
+    found: list[tuple[tuple[str, int], Path]] = []
     for suffix in ALLOWED_SUFFIXES:
         # Exactly its own stamp, not a prefix: `sales` must not match `sales-2024-<stamp>`.
-        pattern = re.compile(re.escape(name) + r"-(\d{8}T\d{6})" + re.escape(suffix))
+        pattern = re.compile(re.escape(name) + r"-(\d{8}T\d{6})(?:-(\d+))?"
+                             + re.escape(suffix))
         for path in folder.glob(f"{name}-*{suffix}"):
             match = pattern.fullmatch(path.name)
             # A symlink in the trash can point anywhere, and a restore that followed one
@@ -282,8 +293,17 @@ def trashed_copies(cfg: Config, repo: str, name: str) -> list[Path]:
                 continue
             if not path.resolve().is_relative_to(root):
                 continue
-            found.append((match.group(1), path))
-    return [path for _stamp, path in sorted(found, key=lambda item: item[0])]
+            found.append(((match.group(1), int(match.group(2) or 0)), path))
+    return [path for _order, path in sorted(found, key=lambda item: item[0])]
+
+
+def _dataset_doc_path(cfg: Config, repo: str, name: str) -> Path:
+    """Where `feed` puts a dataset's document: its id derives from exactly this path."""
+    return cfg.knowledge_dir / repo / "datasets" / f"{name}.md"
+
+
+def _live_dataset_refusal(name: str, path: Path) -> ValueError:
+    return ValueError(f"'{name}' is live at {path}; remove it before restoring this one")
 
 
 def _lock(cfg: Config, name: str) -> IO[str]:
@@ -498,7 +518,7 @@ def _feed_locked(conn: sqlite3.Connection, cfg: Config, path: Path, name: str,
     if len(data) > LARGE_FILE_BYTES:
         warnings.append(f"{path.name} is {len(data) / (1024 * 1024):.0f} MB; feeding anyway")
     resolved_repo = _resolve_repo(cfg, repo)
-    doc_path = cfg.knowledge_dir / resolved_repo / "datasets" / f"{name}.md"
+    doc_path = _dataset_doc_path(cfg, resolved_repo, name)
     existing = _dataset_doc(cfg, name)
     previous_text = existing.read_text() if existing is not None else None
     previous_meta = markdown.parse_frontmatter(previous_text)[0] if previous_text else {}
@@ -793,19 +813,28 @@ def _drop_removed_copy(conn: sqlite3.Connection, cfg: Config, name: str,
     its own trash. Returns the trashed files the caller unlinks once it has committed:
     left behind they are files no row points at, which `purge` can never reach.
 
-    Only a tombstone whose trashed file is this repo's fed dataset is dropped: a removed
-    note called `<name>.md` leaves the same file name, and dropping that one would delete
-    a document the user can still restore.
+    A tombstone is this dataset's only when its id is the one the live path derives: a
+    removed note can be moved to the same trash file name and carry the same frontmatter,
+    and dropping that one would delete a document the user can still restore.
     """
+    from akasha.index import derived_id       # index imports this module for `attach`
+
+    own_id = derived_id("native", _dataset_doc_path(cfg, repo, name))
     trash = cfg.knowledge_dir.parent / "trash"
     stale: list[Path] = []
     for row in conn.execute(
-            "SELECT id, path FROM documents WHERE deleted_at IS NOT NULL").fetchall():
-        path = Path(row["path"])
-        if path.parent != trash or path.name != f"{row['id']}__{name}.md":
+            "SELECT id, path, repo FROM documents WHERE deleted_at IS NOT NULL").fetchall():
+        if row["id"] != own_id:
             continue
-        evidence = knowledge._trashed_dataset(path) if path.is_file() else None
-        if evidence is None or evidence[0] != name or (evidence[1] or "_global") != repo:
+        path = Path(row["path"])
+        if path.parent != trash or path.name != f"{own_id}__{name}.md":
+            continue
+        if not path.is_file():          # a row whose file is gone is still a tombstone
+            continue
+        meta, _body = markdown.parse_frontmatter(path.read_text(errors="replace"))
+        if knowledge._trashed_dataset(row, meta, cfg) != name:
+            continue
+        if (meta.get("repo") or "_global") != repo:
             continue
         conn.execute("DELETE FROM chunks WHERE document_id = ?", (row["id"],))
         conn.execute("DELETE FROM links WHERE from_document_id = ? OR to_document_id = ?",

@@ -13,6 +13,7 @@ import sqlite3
 import sys
 import threading
 import types
+from datetime import datetime, timezone
 from importlib import reload
 from pathlib import Path
 
@@ -1162,3 +1163,174 @@ def test_restore_dataset_refreshes_the_vectors_of_its_cells(env, source, monkeyp
     chunk_ids = {r["id"] for r in conn.execute("SELECT id FROM chunks")}
     vector_ids = {r["chunk_id"] for r in conn.execute("SELECT chunk_id FROM vec_chunks")}
     assert chunk_ids and chunk_ids <= vector_ids
+
+
+def _freeze_trash_stamp(monkeypatch, moment=None):
+    """The trash stamp has one-second resolution, so a test that needs two copies in one
+    second has to hold the clock still."""
+    moment = moment or datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return moment
+
+    monkeypatch.setattr(feed, "datetime", Frozen)
+
+
+def test_refeed_keeps_a_hand_written_note_that_claims_the_dataset(env, source):
+    """`feed` writes `kind: dataset`, the name and the repo together, and a note may carry
+    the same three; dropping a tombstone on that evidence alone would delete the note's row
+    and the file the user can still restore."""
+    conn, cfg = env
+    note = _hand_written(cfg, "prices.md",
+                         "id: k_note\ntitle: Prices\nkind: dataset\nrepo: sample-repo\n"
+                         "dataset: prices\nstatus: active\n"
+                         "created: 2026-01-01\nupdated: 2026-01-01\n",
+                         body="## A\nforged marker\n")
+    index_path(conn, cfg, note, "native", root=None)
+    note_id = conn.execute("SELECT id FROM documents WHERE path = ?",
+                           (str(note),)).fetchone()["id"]
+    note_trash = knowledge.remove(conn, cfg, note_id)
+
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+
+    row = conn.execute("SELECT path, deleted_at FROM documents WHERE id = ?",
+                       (note_id,)).fetchone()
+    assert row is not None and row["deleted_at"], "the note's tombstone is not the dataset's"
+    assert note_trash.exists()
+    assert "forged marker" in note_trash.read_text()
+
+
+def test_restore_of_a_forged_dataset_note_restores_it_as_a_plain_note(env):
+    """The path that says what a document was is gone once it is in the trash, so
+    frontmatter alone would restore a note that claims the dataset into `datasets/` on a
+    copy it never had; the row's id says it is not a fed dataset."""
+    conn, cfg = env
+    note = _hand_written(cfg, "notes/prices.md",
+                         "id: k_note\ntitle: Prices\nkind: dataset\nrepo: sample-repo\n"
+                         "dataset: prices\nstatus: active\n"
+                         "created: 2026-01-01\nupdated: 2026-01-01\n",
+                         body="## A\nforged marker\n")
+    index_path(conn, cfg, note, "native", root=None)
+    note_id = conn.execute("SELECT id FROM documents WHERE path = ?",
+                           (str(note),)).fetchone()["id"]
+    knowledge.remove(conn, cfg, note_id)
+
+    restored = knowledge.restore(conn, cfg, note_id)
+
+    assert restored.parent == cfg.knowledge_dir / "sample-repo"
+    assert "forged marker" in restored.read_text()
+    assert not (cfg.knowledge_dir / "sample-repo" / "datasets").exists()
+
+
+def test_restore_refuses_while_the_name_is_live_in_another_repo(env, source):
+    """Units are keyed by name alone, so a restored document beside a live dataset of the
+    same name would share one set of rows and the next feed of either would overwrite the
+    other; the refusal comes before anything moves."""
+    conn, cfg = env
+    settings = FeedSettings(key="item")
+    feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
+    doc_id = _doc_id(conn, cfg)
+    doc_trash, copy_trash = feed.remove_dataset(conn, cfg, "prices")
+    feed.feed(conn, cfg, source(rows="item,price\nother,7\n"), "prices", settings,
+              repo="other-repo")
+
+    with pytest.raises(ValueError, match="is live at"):
+        knowledge.restore(conn, cfg, doc_id)
+
+    assert doc_trash.exists() and copy_trash.exists()
+    assert not _doc(cfg).exists()
+    assert not _copy(cfg).exists()
+    assert [unit.fields["item"] for unit in feed_store.load_units(conn, "prices")] == ["other"]
+
+
+def test_restore_refuses_while_the_name_is_live_in_the_same_repo(env, source):
+    """A live document at the name's own dataset path is the same refusal as one in another
+    repo: two live documents of one name would answer from one set of unit rows."""
+    conn, cfg = env
+    settings = FeedSettings(key="item")
+    feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
+    doc_id = _doc_id(conn, cfg)
+    doc_trash, copy_trash = feed.remove_dataset(conn, cfg, "prices")
+    later = _hand_written(cfg, "datasets/prices.md",
+                          "id: k_later\ntitle: Dataset: prices\nkind: dataset\n"
+                          "repo: sample-repo\ndataset: prices\nstatus: active\n"
+                          "created: 2026-01-01\nupdated: 2026-01-01\n")
+
+    with pytest.raises(ValueError, match="is live at"):
+        knowledge.restore(conn, cfg, doc_id)
+
+    assert later.is_file()
+    assert doc_trash.exists() and copy_trash.exists()
+
+
+def test_restore_with_an_invalid_frontmatter_name_opens_no_lock(env):
+    """`_lock` builds `files/.locks/<name>.lock` out of the frontmatter value, so a name
+    holding `../` must be refused as a dataset before that path exists; the document
+    restores as the plain note it is."""
+    conn, cfg = env
+    note = _hand_written(cfg, "notes/prices.md",
+                         "id: k_note\ntitle: Prices\nkind: dataset\nrepo: sample-repo\n"
+                         "dataset: ../x\nstatus: active\n"
+                         "created: 2026-01-01\nupdated: 2026-01-01\n",
+                         body="## A\nforged marker\n")
+    index_path(conn, cfg, note, "native", root=None)
+    note_id = conn.execute("SELECT id FROM documents WHERE path = ?",
+                           (str(note),)).fetchone()["id"]
+    knowledge.remove(conn, cfg, note_id)
+
+    restored = knowledge.restore(conn, cfg, note_id)
+
+    assert "forged marker" in restored.read_text()
+    assert restored.parent == cfg.knowledge_dir / "sample-repo"
+    assert not (cfg.knowledge_dir.parent / "files" / ".locks").exists()
+
+
+def test_same_second_extension_switch_restores_the_recorded_copy(env, source, tmp_path,
+                                                                monkeypatch):
+    """An xlsx-to-csv switch and the removal right after it can share one stamp, and the
+    stamp alone makes the older xlsx look newest; restore has to take the copy the
+    document's `file` names."""
+    conn, cfg = env
+    settings = FeedSettings(key="item")
+    _freeze_trash_stamp(monkeypatch)
+    feed.feed(conn, cfg, _xlsx(tmp_path, name="first.xlsx"), "prices", settings,
+              repo="sample-repo")
+    feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
+    doc_id = _doc_id(conn, cfg)
+    _doc_trash, copy_trash = feed.remove_dataset(conn, cfg, "prices")
+    csv_bytes = copy_trash.read_bytes()
+
+    restored = knowledge.restore(conn, cfg, doc_id)
+
+    assert restored == _doc(cfg)
+    assert _copy(cfg, suffix=".csv").read_bytes() == csv_bytes
+    assert not _copy(cfg, suffix=".xlsx").exists()
+    meta, _body = parse_frontmatter(restored.read_text())
+    assert Path(meta["file"]).suffix == ".csv"
+
+
+def test_same_second_trash_moves_never_overwrite(env, source, tmp_path, monkeypatch):
+    """Two copies of one name trashed inside one second get the same stamp, and a move onto
+    the file already there would silently drop the copy it replaced."""
+    conn, cfg = env
+    settings = FeedSettings(key="item")
+    _freeze_trash_stamp(monkeypatch)
+    feed.feed(conn, cfg, _xlsx(tmp_path, name="first.xlsx",
+                               rows=(("item", "price"), ("old", 1))),
+              "prices", settings, repo="sample-repo")
+    feed.feed(conn, cfg, source(rows="item,price\nolder,1\n"), "prices", settings,
+              repo="sample-repo")
+    feed.feed(conn, cfg, _xlsx(tmp_path, name="second.xlsx",
+                               rows=(("item", "price"), ("new", 2))),
+              "prices", settings, repo="sample-repo")
+    first = [path for path in feed.trashed_copies(cfg, "sample-repo", "prices")
+             if path.suffix == ".xlsx"][0]
+    first_bytes = first.read_bytes()
+
+    feed.remove_dataset(conn, cfg, "prices")
+
+    copies = feed.trashed_copies(cfg, "sample-repo", "prices")
+    assert [path.suffix for path in copies] == [".xlsx", ".csv", ".xlsx"]
+    assert first.read_bytes() == first_bytes
