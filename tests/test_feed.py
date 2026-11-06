@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from akasha import feed, feed_store, knowledge
-from akasha.config import load_config
+from akasha.config import IndexRoot, load_config
 from akasha.db import connect
 from akasha.index import index_path
 from akasha.markdown import parse_frontmatter
@@ -1334,3 +1334,49 @@ def test_same_second_trash_moves_never_overwrite(env, source, tmp_path, monkeypa
     copies = feed.trashed_copies(cfg, "sample-repo", "prices")
     assert [path.suffix for path in copies] == [".xlsx", ".csv", ".xlsx"]
     assert first.read_bytes() == first_bytes
+
+
+def test_lifecycle_with_an_index_root_covering_the_knowledge_dir(env, source):
+    """A configured root that contains the knowledge dir is part of a document's derived
+    id, so a tombstone check that always derives with `root=None` no longer recognizes its
+    own dataset: the re-feed collides, and a restore puts the document back outside
+    `datasets/` with the copy left in the trash."""
+    conn, cfg = env
+    cfg.index_roots = [IndexRoot(path=str(cfg.knowledge_dir.parent), source="notes")]
+    settings = FeedSettings(key="item")
+    feed.feed(conn, cfg, source(), "prices", settings, repo="sample-repo")
+    feed.remove_dataset(conn, cfg, "prices")
+
+    feed.feed(conn, cfg, source(rows="item,price\nbolt,9\n"), "prices", settings,
+              repo="sample-repo")
+    assert [unit.fields["price"] for unit in feed_store.load_units(conn, "prices")] == ["9"]
+
+    doc_id = _doc_id(conn, cfg)
+    copy_bytes = _copy(cfg).read_bytes()
+    feed.remove_dataset(conn, cfg, "prices")
+
+    restored = knowledge.restore(conn, cfg, doc_id)
+
+    assert restored == _doc(cfg)
+    assert _copy(cfg).read_bytes() == copy_bytes
+    assert [unit.fields["price"] for unit in feed_store.load_units(conn, "prices")] == ["9"]
+
+
+def test_restore_takes_the_recorded_extension_over_a_newer_other_copy(env, source):
+    """`files/.trash` is a directory on disk, so a copy of the other extension can sit
+    there with a later stamp than the document's own; restoring that one would put bytes
+    under a document whose `file` names the other copy."""
+    conn, cfg = env
+    feed.feed(conn, cfg, source(), "prices", FeedSettings(key="item"), repo="sample-repo")
+    doc_id = _doc_id(conn, cfg)
+    _doc_trash, copy_trash = feed.remove_dataset(conn, cfg, "prices")
+    copy_bytes = copy_trash.read_bytes()
+    newer = copy_trash.with_name("prices-20990101T000000.xlsx")
+    newer.write_bytes(b"not the recorded copy")
+
+    restored = knowledge.restore(conn, cfg, doc_id)
+
+    assert restored == _doc(cfg)
+    assert _copy(cfg, suffix=".csv").read_bytes() == copy_bytes
+    assert not _copy(cfg, suffix=".xlsx").exists()
+    assert newer.exists()

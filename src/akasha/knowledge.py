@@ -133,6 +133,34 @@ def _owning_root(cfg: Config, path: Path):
             return root
     return None
 
+def _index_target(conn: sqlite3.Connection, cfg: Config, path: Path,
+                  source: str | None = None):
+    """The source and root a reindex of `path` uses, or takes from the caller.
+
+    A row already at the path keeps the source it was indexed with; anything else is
+    native. The configured root that contains the path is the other half: both go into the
+    id a document without a frontmatter `id` derives.
+    """
+    if source is None:
+        row = conn.execute("SELECT source FROM documents WHERE path = ?",
+                           (str(path),)).fetchone()
+        source = row["source"] if row else "native"
+    return source, _owning_root(cfg, path)
+
+
+def _expected_id(conn: sqlite3.Connection, cfg: Config, path: Path,
+                 source: str | None = None) -> str:
+    """The id indexing `path` gives it, by the same source and root rule as `_reindex`.
+
+    The dataset lifecycle needs it for a path that no longer exists: a trashed row is that
+    dataset's only if it holds the id its live path would have had.
+    """
+    from akasha.index import derived_id       # index imports this module
+
+    resolved, root = _index_target(conn, cfg, path, source)
+    return derived_id(resolved, path, Path(root.path).expanduser() if root else None)
+
+
 def _require_appendable(row: sqlite3.Row, cfg: Config) -> None:
     """Native always; an indexed root only when it has opted in with `writable`."""
     if row["source"] == "native":
@@ -204,9 +232,7 @@ def _reindex(conn: sqlite3.Connection, cfg: Config, path: Path, commit: bool = T
     # Reindex as whatever the document already is: passing "native" and no root would
     # relabel an indexed-root document and drop the repo and feature, both of which
     # index_path derives from the path relative to its root.
-    row = conn.execute("SELECT source FROM documents WHERE path = ?", (str(path),)).fetchone()
-    source = row["source"] if row else "native"
-    root = _owning_root(cfg, path)
+    source, root = _index_target(conn, cfg, path)
 
     conn.execute("DELETE FROM chunks WHERE document_id IN "
                  "(SELECT id FROM documents WHERE path = ?)", (str(path),))
@@ -622,7 +648,7 @@ def restore(conn: sqlite3.Connection, cfg: Config, doc_id: str) -> Path:
     if not trashed.exists():
         raise ValueError(f"{doc_id} has no file in the trash to restore; purge the row instead")
     meta, _body = parse_frontmatter(trashed.read_text(errors="replace"))
-    dataset = _trashed_dataset(row, meta, cfg)
+    dataset = _trashed_dataset(conn, row, meta, cfg)
     if dataset is None:
         return _restore_locked(conn, cfg, row, trashed, None, meta)
     from akasha.feed import _lock, _unlock       # feed imports this module
@@ -717,7 +743,8 @@ def _restore_locked(conn: sqlite3.Connection, cfg: Config, row: sqlite3.Row,
             emit(conn, "knowledge.vectors_failed", id=doc_id, error=str(exc))
     return target
 
-def _trashed_dataset(row: sqlite3.Row, meta: dict, cfg: Config) -> str | None:
+def _trashed_dataset(conn: sqlite3.Connection, row: sqlite3.Row, meta: dict,
+                     cfg: Config) -> str | None:
     """The dataset this trashed row is, or None for any other document.
 
     `feed` writes `kind: dataset`, the name and the repo together, and it is the only
@@ -739,10 +766,8 @@ def _trashed_dataset(row: sqlite3.Row, meta: dict, cfg: Config) -> str | None:
         # Not a name `feed` would create, so this is not a fed dataset; `_lock` would also
         # build `files/.locks/<name>.lock` out of a value that may hold `../`.
         return None
-    from akasha.index import derived_id
-
-    if derived_id("native",
-                  _dataset_doc_path(cfg, row["repo"] or "_global", name)) != row["id"]:
+    live = _dataset_doc_path(cfg, row["repo"] or "_global", name)
+    if _expected_id(conn, cfg, live, source=row["source"]) != row["id"]:
         return None
     return name
 

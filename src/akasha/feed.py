@@ -817,13 +817,13 @@ def _drop_removed_copy(conn: sqlite3.Connection, cfg: Config, name: str,
     removed note can be moved to the same trash file name and carry the same frontmatter,
     and dropping that one would delete a document the user can still restore.
     """
-    from akasha.index import derived_id       # index imports this module for `attach`
-
-    own_id = derived_id("native", _dataset_doc_path(cfg, repo, name))
+    own_path = _dataset_doc_path(cfg, repo, name)
     trash = cfg.knowledge_dir.parent / "trash"
     stale: list[Path] = []
     for row in conn.execute(
-            "SELECT id, path, repo FROM documents WHERE deleted_at IS NOT NULL").fetchall():
+            "SELECT id, path, repo, source FROM documents"
+            " WHERE deleted_at IS NOT NULL").fetchall():
+        own_id = knowledge._expected_id(conn, cfg, own_path, source=row["source"])
         if row["id"] != own_id:
             continue
         path = Path(row["path"])
@@ -832,7 +832,7 @@ def _drop_removed_copy(conn: sqlite3.Connection, cfg: Config, name: str,
         if not path.is_file():          # a row whose file is gone is still a tombstone
             continue
         meta, _body = markdown.parse_frontmatter(path.read_text(errors="replace"))
-        if knowledge._trashed_dataset(row, meta, cfg) != name:
+        if knowledge._trashed_dataset(conn, row, meta, cfg) != name:
             continue
         if (meta.get("repo") or "_global") != repo:
             continue
