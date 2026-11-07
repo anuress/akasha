@@ -34,7 +34,7 @@ headers it had to rename, and any warnings. The indexer needs no change, because
 splits, diffs and chunks whatever the table maps to. Add tests to `tests/test_splitters.py`
 and use synthetic data only: the repository is public. A new suffix also goes into
 `feed.ALLOWED_SUFFIXES`, which `feed add` checks before it splits anything, and into both help
-strings that name the formats: `akasha feed --help` and `feed add`'s. Add one feed-level test
+strings that name the formats: the `feed` line of `akasha --help` and `feed add`'s. Add one feed-level test
 in `tests/test_feed.py`: splitter tests never reach that check, so a suffix the splitter
 knows and the command does not stays green there and fails in use.
 
