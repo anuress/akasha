@@ -33,10 +33,10 @@ returns a `SplitResult`: the `Unit(locator, key, label, fields)` rows, the heade
 headers it had to rename, and any warnings. The indexer needs no change, because `feed`
 splits, diffs and chunks whatever the table maps to. Add tests to `tests/test_splitters.py`
 and use synthetic data only: the repository is public. A new suffix also goes into
-`feed.ALLOWED_SUFFIXES`, which `feed add` checks before it splits anything, and into the
-accepted-format line of `feed add`'s `--help`. Add one feed-level test in
-`tests/test_feed.py`: splitter tests never reach that check, so a suffix the splitter knows
-and the command does not stays green there and fails in use.
+`feed.ALLOWED_SUFFIXES`, which `feed add` checks before it splits anything, and into both help
+strings that name the formats: `akasha feed --help` and `feed add`'s. Add one feed-level test
+in `tests/test_feed.py`: splitter tests never reach that check, so a suffix the splitter
+knows and the command does not stays green there and fails in use.
 
 A dependency a format needs is imported inside its splitter and declared as an extra, so the
 package installs without it. When the import fails, the message names the extra, the way

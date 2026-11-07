@@ -148,16 +148,17 @@ akasha feed add fruits.csv --as fruits --key id
 
 The first feed prints `first feed: N units`. Feeding the same name again replaces its rows
 and reports what changed: `+A -R ~C`, then one line per row, with a changed cell shown as
-`color: -red` and `color: +green`. An eight-row `fruits.csv` prints `first feed: 8 units` the
-first time and, once one row arrived and two cells changed, `+1 -0 ~2` the next. The listing
-stops at 50 rows with `… N more (use --full)`; `--full` prints every row and every change
-line of a cell. A feed that changes nothing prints `unchanged`.
+`color: -red` and `color: +green`. An eight-data-row `fruits.csv` prints `first feed: 8 units`
+the first time and, once one row was added and two rows changed, `+1 -0 ~2` the next: the
+line counts rows added, removed and changed, not cells. The listing stops at 50 rows with
+`… N more (use --full)`; `--full` prints every row and every change line of a cell. A feed
+that changes nothing prints `unchanged`.
 
 A row is addressed two ways: `row:N` is its place in the export (`row:2` is the first data
 row under a header on row 1), and `key:V` is the value of that row's `--key`. A key value
-is usable as a locator only when it is non-empty and unique in the export: a blank or
-repeated key leaves the row addressable as `row:N` alone, and the feed warns once, naming
-the column.
+is usable as a locator only when it is non-empty and unique among the rows the feed kept, and
+`--require` decides which those are: a blank or repeated key leaves the row addressable as
+`row:N` alone, and the feed warns once, naming the column.
 
 ```sh
 akasha feed list
