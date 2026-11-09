@@ -1553,3 +1553,38 @@ def test_a_big_external_document_keeps_the_readonly_hint_in_outline_mode(env, tm
     assert "outline" in got
     assert got["writable"] is False and "knowledge_write" in got["readonly_hint"]
 
+
+
+def test_search_memory_expires_and_the_next_search_sweeps_the_old_entry(env, monkeypatch):
+    """An entry older than the window must stop adding sections, and the next search must
+    drop it, or a stale pointer outlives the question it answered."""
+    clock = [1000.0]
+    monkeypatch.setattr(mcp_server, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    big = call_tool("knowledge_write", {"title": "Big A", "body": _big_body(), "repo": "r"})
+    other = call_tool("knowledge_write", {"title": "Gamma", "body": "## Gamma\ngamma token",
+                                         "repo": "r"})
+    mcp_server.remember_searches("stdio")
+    call_tool("knowledge_search", {"q": "beta", "all_repos": True})
+
+    fresh = call_tool("knowledge_get", {"id": big["id"]})
+
+    clock[0] += mcp_server.RECENT_SECONDS + 1
+    stale = call_tool("knowledge_get", {"id": big["id"]})
+    call_tool("knowledge_search", {"q": "gamma", "all_repos": True})
+
+    assert [s["section"] for s in fresh["sections"]] == [2]
+    assert "sections" not in stale
+    assert big["id"] not in mcp_server._recent
+    assert other["id"] in mcp_server._recent
+
+
+def test_a_dataset_cell_hit_carries_no_section(env, tmp_path):
+    """Section numbers come from a document's markdown headings, and a cell is a chunk of
+    a row rather than of the document, so it must not borrow the dataset document's."""
+    _dataset(env, tmp_path, rows="item,note\nbolt,Brass fastener\n")
+
+    hits = call_tool("knowledge_search", {"q": "Brass fastener", "all_repos": True})
+
+    cell_hits = [h for h in hits if "unit" in h]
+    assert cell_hits
+    assert all("section" not in h for h in cell_hits)
