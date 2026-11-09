@@ -37,6 +37,13 @@ class Chunk:
     ord: int
 
 
+@dataclass
+class Section:
+    number: int
+    heading: str
+    text: str
+
+
 def first_heading(body: str) -> str | None:
     """First H1 line in the body, or None. Files that share a filename still have distinct
     H1s, which `path.stem` would ignore."""
@@ -161,6 +168,78 @@ def chunk(body: str) -> list[Chunk]:
         buffer.append(line)
     flush()
     return chunks
+
+
+def _starts_section(heading: str) -> bool:
+    m = HEADING.match(heading)
+    return bool(m) and len(m.group(1)) <= 2
+
+
+def section_numbers(headings: list[str]) -> list[int]:
+    """Number chunk headings in ord order: 0 before the first `#`/`##`, then 1 each."""
+    numbers: list[int] = []
+    number = 0
+    prev = ""
+    for heading in headings:
+        # A ceiling-split chunk repeats its heading; only a change starts a section.
+        if _starts_section(heading) and heading != prev:
+            number += 1
+        numbers.append(number)
+        prev = heading
+    return numbers
+
+
+def sections(body: str) -> list[Section]:
+    """Group a body into sections addressed by number, since headings repeat.
+
+    # ponytail: two adjacent `#`/`##` headings with identical text merge into one section
+    # and the second heading line is lost; upgrade if a document needs both.
+    """
+    chunks = chunk(body)
+    numbers = section_numbers([c.heading for c in chunks])
+    grouped: list[Section] = []
+    prev = ""
+    for c, number in zip(chunks, numbers):
+        if not grouped or grouped[-1].number != number:
+            heading = "" if number == 0 else c.heading
+            grouped.append(Section(number=number, heading=heading, text=""))
+        # A chunk leaves its heading out of body, so the first one puts it back.
+        piece = f"{c.heading}\n\n{c.body}" if c.heading and c.heading != prev else c.body
+        # Ceiling-split pieces are one run of text: joining them with "" reads the
+        # section back without blank lines the file never had.
+        joint = "\n\n" if grouped[-1].text and c.heading != prev else ""
+        grouped[-1].text += joint + piece
+        prev = c.heading
+    return grouped
+
+
+def sections_of(text: str) -> list[Section]:
+    """Sections of a document as stored, so MCP and CLI number one file the same way."""
+    return sections(strip_data_uris(parse_frontmatter(text)[1]))
+
+
+def _size(chars: int) -> str:
+    return f"{chars / 1000:.1f}k" if chars >= 1000 else str(chars)
+
+
+def outline(secs: list[Section], cap: int) -> str:
+    """One line per section, capped, ending with the count it left out."""
+    lines = [f"{s.number} · {s.heading or '(opening)'} · {_size(len(s.text))}" for s in secs]
+    if not lines:
+        return ""
+    last = secs[-1].number
+    shown = 0
+    for i in range(len(lines)):
+        omitted = len(lines) - i - 1
+        tail = [f"… {omitted} more sections, up to {last}"] if omitted else []
+        # The truncation line is part of the budget, or the cap overflows by it.
+        if len("\n".join(lines[:i + 1] + tail)) > cap:
+            break
+        shown = i + 1
+    if shown == len(lines):
+        return "\n".join(lines)
+    left_out = len(lines) - shown
+    return "\n".join(lines[:shown] + [f"… {left_out} more sections, up to {last}"])
 
 
 def render(meta: dict, body: str) -> str:

@@ -1,4 +1,15 @@
-from akasha.markdown import CHUNK_CEILING, chunk, parse_frontmatter, render, strip_data_uris
+from akasha.markdown import (
+    CHUNK_CEILING,
+    Section,
+    chunk,
+    outline,
+    parse_frontmatter,
+    render,
+    section_numbers,
+    sections,
+    sections_of,
+    strip_data_uris,
+)
 
 
 def test_parse_frontmatter_extracts_scalars_and_lists():
@@ -187,3 +198,90 @@ def test_strip_data_uris_does_not_eat_the_backtick_after_a_mention():
     assert "[image]" in out
     assert "`[image]`" in out, "the code-span backtick pair must survive"
     assert out == "(see below). Strips `[image]` prefix, decodes\n"
+
+
+def test_section_numbers_calls_the_text_before_the_first_heading_section_zero():
+    assert section_numbers(["", "## Shelving", "## Exceptions"]) == [0, 1, 2]
+
+
+def test_a_document_that_opens_with_a_heading_has_no_section_zero():
+    """Number 0 means "the text before the first heading", so a document whose first
+    chunk is a heading must start at 1 rather than leave an empty section 0."""
+    assert section_numbers(["## Shelving", "## Exceptions"]) == [1, 2]
+
+
+def test_a_leading_deeper_heading_belongs_to_section_zero():
+    """`###` is not a section boundary, so a document led by one has its own section 0
+    rather than starting at 1 with the heading in no section."""
+    assert section_numbers(["### Detail", "## Shelving"]) == [0, 1]
+
+
+def test_the_pieces_of_a_split_section_share_one_number():
+    body = "## Big\n" + "\n\n".join("x" * 400 for _ in range(30))
+    headings = [c.heading for c in chunk(body)]
+    assert len(headings) > 1
+    assert set(section_numbers(headings)) == {1}
+
+
+def test_a_deeper_heading_stays_in_its_parent_section():
+    assert section_numbers(["## Parent", "### Child", "## Sibling"]) == [1, 1, 2]
+
+
+def test_a_repeated_heading_gets_a_new_number_when_a_sibling_separates_it():
+    """Headings repeat within a document, so the boundary is a change of heading, not the
+    heading text on its own."""
+    assert section_numbers(["## Notes", "## Other", "## Notes"]) == [1, 2, 3]
+
+
+def test_a_tab_after_the_hash_still_starts_a_section():
+    assert section_numbers(["#\tTitle", "## Child"]) == [1, 2]
+
+
+def test_a_section_is_headed_by_its_first_chunk_and_reads_back_without_extra_blank_lines():
+    paragraphs = "\n\n".join("x" * 400 for _ in range(30))
+    secs = sections("## Big\n\n" + paragraphs + "\n")
+    assert [s.number for s in secs] == [1]
+    assert secs[0].heading == "## Big"
+    assert secs[0].text == "## Big\n\n" + paragraphs
+
+
+def test_section_zero_keeps_its_own_text_and_has_no_heading():
+    secs = sections("intro\n\n## Shelving\nbody\n")
+    assert [(s.number, s.heading) for s in secs] == [(0, ""), (1, "## Shelving")]
+    assert secs[0].text == "intro"
+    assert secs[1].text == "## Shelving\n\nbody"
+
+
+def test_sections_of_reads_the_body_without_frontmatter_or_data_uris():
+    text = (
+        "---\ntitle: T\n---\n\nintro\n## Screenshot\n"
+        "![shot](data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==)\n"
+    )
+    secs = sections_of(text)
+    assert [s.heading for s in secs] == ["", "## Screenshot"]
+    assert "iVBORw0KGgo" not in secs[1].text
+    assert "[image]" in secs[1].text
+
+
+def test_outline_writes_one_line_per_section_in_the_documented_format():
+    secs = [
+        Section(0, "", "x" * 432),
+        Section(1, "# Cart", "y" * 120),
+        Section(2, "## Recent Changes", "z" * 4200),
+    ]
+    assert outline(secs, 3000) == (
+        "0 · (opening) · 432\n1 · # Cart · 120\n2 · ## Recent Changes · 4.2k"
+    )
+
+
+def test_outline_counts_the_sections_it_omits_inside_its_cap():
+    """The truncation line counts against the cap, or the outline overflows by exactly the
+    line that tells the reader how much is missing."""
+    secs = [Section(0, "", "x")]
+    secs += [Section(n, f"## Part {n}", "y" * 4200) for n in range(1, 41)]
+    out = outline(secs, 300)
+    lines = out.splitlines()
+    assert len(out) <= 300
+    assert lines[0] == "0 · (opening) · 1"
+    assert len(lines) < len(secs) + 1
+    assert lines[-1] == f"… {len(secs) - (len(lines) - 1)} more sections, up to 40"
