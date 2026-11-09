@@ -13,6 +13,7 @@ from akasha.config import Config
 from akasha.kinds import ALIASES, KINDS, canonical_kind, custom_kind_error, validate_custom_kinds
 from akasha.db import new_id, now
 from akasha.markdown import parse_frontmatter, render
+from akasha.security import redact, scrub_injection
 
 # The events-retention pass imports this, so the window `stats` reports against and the
 # window events are actually kept for cannot disagree.
@@ -75,6 +76,17 @@ def _doc_row(conn: sqlite3.Connection, doc_id: str) -> sqlite3.Row:
 def get(conn: sqlite3.Connection, doc_id: str) -> sqlite3.Row:
     """Return the full document row."""
     return _doc_row(conn, doc_id)
+
+
+def readable(path: str, cfg: Config) -> tuple[str, list[str], list[str]]:
+    """Document text with the redaction and injection scrub the indexer applies, so no
+    read path hands out a span the index would have defused."""
+    text = Path(path).read_text()
+    redacted: list[str] = []
+    if cfg.scan_secrets:
+        text, redacted = redact(text)
+    text, fired = scrub_injection(text)
+    return text, redacted, fired
 
 _READONLY_HINT = ("It belongs to a read-only source: record the change in a native "
                   "document with knowledge_write instead of editing it.")

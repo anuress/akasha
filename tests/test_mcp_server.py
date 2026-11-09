@@ -43,6 +43,14 @@ def _listed():
     return asyncio.run(mcp_server.build_server().list_tools())
 
 
+@pytest.fixture(autouse=True)
+def _fresh_search_memory(monkeypatch):
+    """Search memory is module state that outlives a test; a leaked entry would add
+    `sections` to an unrelated outline read."""
+    monkeypatch.setattr(mcp_server, "_remembering", False)
+    monkeypatch.setattr(mcp_server, "_recent", {})
+
+
 # --- the surface -----------------------------------------------------------------------
 
 def test_the_server_lists_exactly_the_kept_tools():
@@ -108,7 +116,7 @@ def test_tools_expose_exactly_the_documented_parameters():
     documented = {
         "knowledge_search": {"all_repos", "as_of", "feature", "include_archived", "kind",
                              "limit", "match_mode", "max_chars", "query", "repo", "source"},
-        "knowledge_get": {"id", "max_chars", "offset"},
+        "knowledge_get": {"id", "max_chars", "offset", "section"},
         "knowledge_write": {"body", "feature", "kind", "new_kind", "repo", "supersedes", "title"},
         "knowledge_update": {"body", "expected_updated", "id", "kind", "match",
                              "replacement", "status", "title"},
@@ -190,7 +198,7 @@ def test_search_hits_use_the_core_shape_without_path_or_defaults(env):
     call_tool("knowledge_write", {"title": "T", "body": "## H\ncap-token wins", "repo": "r"})
     hit = call_tool("knowledge_search", {"q": "cap-token", "all_repos": True})[0]
     assert "path" not in hit
-    assert set(hit) == {"id", "document_id", "score", "repo", "heading", "text"}
+    assert set(hit) == {"id", "document_id", "score", "repo", "heading", "text", "section"}
 
 
 def test_knowledge_get_returns_the_path(env):
@@ -360,12 +368,14 @@ def test_successful_get_records_a_small_read_event(env):
     conn, _ = env
     doc = call_tool("knowledge_write", {"title": "T", "body": "## H\nnotes", "repo": "r"})
 
-    call_tool("knowledge_get", {"id": doc["id"]})
-    call_tool("knowledge_get", {"id": doc["id"], "offset": 2})
+    full = call_tool("knowledge_get", {"id": doc["id"]})
+    paged = call_tool("knowledge_get", {"id": doc["id"], "offset": 2})
 
     assert _events(conn, "knowledge.read") == [
-        {"document": doc["id"], "source": "native", "offset": 2},
-        {"document": doc["id"], "source": "native"},
+        {"document": doc["id"], "source": "native", "mode": "text",
+         "chars": len(paged["text"]), "offset": 2},
+        {"document": doc["id"], "source": "native", "mode": "text",
+         "chars": len(full["text"])},
     ]
 
 
@@ -1340,3 +1350,206 @@ def test_warming_decides_from_config_without_connecting(env, monkeypatch):
     thread = mcp_server._warm_embedder()
     assert thread is not None
     thread.join(5)
+
+
+# --- big documents: outline, sections and search memory --------------------------------
+
+
+def _big_body() -> str:
+    """Over OUTLINE_OVER, with an opening and two sections a search can tell apart."""
+    return ("intro line\n\n## First\nalpha " + "a" * 4000
+            + "\n\n## Second\nbeta " + "b" * 5000 + "\n")
+
+
+def test_a_big_document_returns_its_opening_and_outline_instead_of_the_body(env):
+    doc = call_tool("knowledge_write", {"title": "Big", "body": _big_body(), "repo": "r"})
+
+    got = call_tool("knowledge_get", {"id": doc["id"]})
+
+    assert got["text"] == "intro line"
+    numbers = [line.split(" · ")[0] for line in got["outline"].splitlines()]
+    assert numbers == ["0", "1", "2"]
+    assert "## First" in got["outline"] and "aaaa" not in got["outline"]
+    assert got["next"] == "Outline only: knowledge_get(id, section=N) for a section's text"
+    assert "sections" not in got
+    assert got["withheld_chars"] > 8000
+
+
+def test_a_small_document_still_comes_back_as_text(env):
+    doc = call_tool("knowledge_write", {"title": "Small", "body": "## H\ntiny body",
+                                        "repo": "r"})
+
+    got = call_tool("knowledge_get", {"id": doc["id"]})
+
+    assert "## H\ntiny body" in got["text"]
+    assert "outline" not in got and "next" not in got and "sections" not in got
+
+
+def test_section_returns_just_that_section_and_pages_within_it(env):
+    doc = call_tool("knowledge_write", {"title": "Big", "body": _big_body(), "repo": "r"})
+
+    got = call_tool("knowledge_get", {"id": doc["id"], "section": 1})
+    page = call_tool("knowledge_get", {"id": doc["id"], "section": 1,
+                                        "max_chars": 100, "offset": 20})
+
+    assert got["section"] == 1 and got["heading"] == "## First"
+    assert got["text"].startswith("## First\n\nalpha")
+    assert "beta" not in got["text"]
+    assert len(page["text"]) == 100 and page["offset"] == 20
+    assert page["withheld_chars"] > 0
+
+
+def test_an_unknown_section_names_the_range_that_exists(env):
+    doc = call_tool("knowledge_write", {"title": "Big", "body": _big_body(), "repo": "r"})
+
+    got = call_tool("knowledge_get", {"id": doc["id"], "section": 99})
+
+    assert got == {"error": "section 99 not found; this document has sections 0..2"}
+
+
+def test_a_document_with_no_sections_says_so(env):
+    doc = call_tool("knowledge_write", {"title": "Bare", "body": "## Bare\n", "repo": "r"})
+
+    got = call_tool("knowledge_get", {"id": doc["id"], "section": 0})
+
+    assert got == {"error": "this document has no sections; omit section to read it"}
+
+
+def test_section_zero_is_unknown_when_the_document_has_no_opening(env):
+    doc = call_tool("knowledge_write", {"title": "T", "body": "## Only\nbody", "repo": "r"})
+
+    got = call_tool("knowledge_get", {"id": doc["id"], "section": 0})
+
+    assert got == {"error": "section 0 not found; this document has sections 1..1"}
+
+
+def test_an_explicit_window_returns_the_raw_text_of_a_big_document(env):
+    """A caller that pages by hand must not be switched to an outline."""
+    doc = call_tool("knowledge_write", {"title": "Big", "body": _big_body(), "repo": "r"})
+
+    for explicit in ({"max_chars": 20000}, {"offset": 0}):
+        got = call_tool("knowledge_get", {"id": doc["id"], **explicit})
+        assert "intro line" in got["text"] and "beta" in got["text"]
+        assert "outline" not in got
+
+
+def test_a_big_document_without_headings_still_pages_as_text(env):
+    doc = call_tool("knowledge_write", {"title": "Flat", "body": "z" * 9000, "repo": "r"})
+
+    got = call_tool("knowledge_get", {"id": doc["id"]})
+
+    assert "outline" not in got
+    assert got["text"].endswith("z" * 9000)
+
+
+def test_a_hit_on_the_opening_carries_section_zero(env):
+    call_tool("knowledge_write", {"title": "Big", "body": _big_body(), "repo": "r"})
+
+    hit = call_tool("knowledge_search", {"q": "intro", "all_repos": True})[0]
+
+    assert hit["section"] == 0
+
+
+def test_a_hits_section_holds_the_text_the_hit_quoted(env):
+    call_tool("knowledge_write", {"title": "Big", "body": _big_body(), "repo": "r"})
+    hit = call_tool("knowledge_search", {"q": "beta", "all_repos": True})[0]
+
+    got = call_tool("knowledge_get", {"id": hit["document_id"], "section": hit["section"]})
+
+    assert hit["section"] == 2
+    assert hit["text"] in got["text"]
+
+
+def test_a_search_in_this_session_adds_the_matched_section_to_an_outline_read(env):
+    conn, _ = env
+    doc = call_tool("knowledge_write", {"title": "Big", "body": _big_body(), "repo": "r"})
+    mcp_server.remember_searches("stdio")
+    call_tool("knowledge_search", {"q": "beta", "all_repos": True})
+
+    got = call_tool("knowledge_get", {"id": doc["id"]})
+
+    assert [s["section"] for s in got["sections"]] == [2]
+    assert got["sections"][0]["heading"] == "## Second"
+    assert "beta" in got["sections"][0]["text"]
+    assert got["text"] == "intro line"
+    [event] = _events(conn, "knowledge.read")
+    assert event["chars"] == (len(got["text"]) + len(got["outline"])
+                              + len(got["sections"][0]["text"]))
+
+
+def test_a_match_on_the_opening_adds_no_sections_because_text_carries_it(env):
+    doc = call_tool("knowledge_write", {"title": "Big", "body": _big_body(), "repo": "r"})
+    mcp_server.remember_searches("stdio")
+    call_tool("knowledge_search", {"q": "intro", "all_repos": True})
+
+    got = call_tool("knowledge_get", {"id": doc["id"]})
+
+    assert "sections" not in got
+
+
+def test_search_memory_is_off_until_enabled(env):
+    doc = call_tool("knowledge_write", {"title": "Big", "body": _big_body(), "repo": "r"})
+    call_tool("knowledge_search", {"q": "beta", "all_repos": True})
+
+    got = call_tool("knowledge_get", {"id": doc["id"]})
+
+    assert "sections" not in got
+
+
+def test_a_remembered_match_survives_an_append(env):
+    """Section numbers, not chunk ids: an append reindexes and the ids change."""
+    doc = call_tool("knowledge_write", {"title": "Big", "body": _big_body(), "repo": "r"})
+    mcp_server.remember_searches("stdio")
+    call_tool("knowledge_search", {"q": "beta", "all_repos": True})
+    call_tool("knowledge_append", {"id": doc["id"], "text": "delta",
+                                    "heading": "## Third"})
+
+    got = call_tool("knowledge_get", {"id": doc["id"]})
+
+    assert [s["section"] for s in got["sections"]] == [2]
+
+
+def test_search_memory_refuses_a_transport_that_outlives_the_session():
+    with pytest.raises(ValueError, match="stdio transport"):
+        mcp_server.remember_searches("streamable-http")
+
+
+def test_a_section_read_records_its_mode_and_chars(env):
+    conn, _ = env
+    doc = call_tool("knowledge_write", {"title": "Big", "body": _big_body(), "repo": "r"})
+
+    got = call_tool("knowledge_get", {"id": doc["id"], "section": 2})
+
+    [event] = _events(conn, "knowledge.read")
+    assert event["mode"] == "section"
+    assert event["chars"] == len(got["text"])
+    assert event["source"] == "native"
+
+
+def test_an_outline_read_records_its_mode_and_chars(env):
+    conn, _ = env
+    doc = call_tool("knowledge_write", {"title": "Big", "body": _big_body(), "repo": "r"})
+
+    got = call_tool("knowledge_get", {"id": doc["id"]})
+
+    [event] = _events(conn, "knowledge.read")
+    assert event["mode"] == "outline"
+    assert event["chars"] == len(got["text"]) + len(got["outline"])
+    assert "offset" not in event
+
+
+def test_a_big_external_document_keeps_the_readonly_hint_in_outline_mode(env, tmp_path):
+    from akasha.index import index_path
+
+    conn, cfg = env
+    root = tmp_path / "imported"
+    root.mkdir()
+    doc = root / "notes.md"
+    doc.write_text(_big_body())
+    doc_id = index_path(conn, cfg, doc, "sample-notes", root=root)[0]
+
+    got = call_tool("knowledge_get", {"id": doc_id})
+
+    assert "outline" in got
+    assert got["writable"] is False and "knowledge_write" in got["readonly_hint"]
+

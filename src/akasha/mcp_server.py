@@ -12,6 +12,7 @@ import json
 import sqlite3
 import sys
 import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from akasha.db import SchemaMismatch, connect
 from akasha.events import emit
 from akasha.features import show as feature_show_core
 from akasha.gitctx import resolve_repo
+from akasha.markdown import outline, section_numbers, sections_of, strip_data_uris
 from akasha.markdown import parse_frontmatter as read_frontmatter
 from akasha.search import iso_date, link_candidates, search as do_search
 from akasha.security import redact, scrub_injection
@@ -46,6 +48,25 @@ def _resolved_repo(cfg: Config, args: dict) -> str | None:
 # megabytes); ordinary results pass untouched.
 MAX_HIT_CHARS = 2000
 MAX_DOC_CHARS = fsck.MAX_READ_CHARS
+
+# Under this the whole document costs less context than the extra round trip an outline
+# costs; most documents are well under it.
+OUTLINE_OVER = 8000
+# The opening is usually short; the cap stops a long preamble becoming the next big read.
+OPENING_CHARS = 1500
+# Append logs can have over a hundred headings; the outline must not become a big read.
+OUTLINE_CHARS = 3000
+# Enough for the sections a search pointed at, and under a third of the old 20k read.
+MATCHED_CHARS = 6000
+# A search older than this probably belonged to an earlier question.
+RECENT_SECONDS = 1800
+
+# Search memory is per session: each client process spawns its own server, so this dies
+# with the session and is never shared between agents.
+_remembering = False
+_recent: dict[str, tuple[float, list[int]]] = {}
+
+
 MAX_FINDINGS = 50
 FSCK_LIMIT = 10
 TIMELINE_LIMIT = 15
@@ -63,6 +84,57 @@ MAX_FEED_RESPONSE_CHARS = 60_000
 # A refusal out of a dataset tool can quote export text (an unknown column names every
 # header), so these tools' error messages cross the same boundary as their output.
 DATASET_TOOLS = frozenset({"knowledge_feed", "knowledge_feed_get", "knowledge_feed_query"})
+
+
+def remember_searches(transport: str) -> None:
+    """Remember which sections a search hit, for the reads that follow in this session."""
+    if transport != "stdio":
+        raise ValueError("search memory is per session and needs the stdio transport")
+    global _remembering
+    _remembering = True
+
+
+def _section_index(conn, hits) -> dict[str, int]:
+    """Chunk id to section number, in one query for the whole result set.
+
+    A hit carries the section it sits in, so the caller can ask for that section. The
+    number comes from the index while `knowledge_get` numbers the file.
+    """
+    prose = [h for h in hits if h.unit is None]
+    if not prose:
+        return {}
+    ids = sorted({h.document_id for h in prose})
+    marks = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT id, document_id, heading FROM chunks WHERE document_id IN ({marks}) "
+        "ORDER BY document_id, ord", ids).fetchall()
+    per_doc: dict[str, list[tuple[str, str]]] = {}
+    for row in rows:
+        per_doc.setdefault(row["document_id"], []).append((row["id"], row["heading"]))
+    index: dict[str, int] = {}
+    for chunk_rows in per_doc.values():
+        numbers = section_numbers([heading for _id, heading in chunk_rows])
+        for (chunk_id, _heading), number in zip(chunk_rows, numbers):
+            index[chunk_id] = number
+    return index
+
+
+def _remember(hits, sections: dict[str, int]) -> None:
+    """Record per document the sections this search hit, in rank order, without
+    duplicates. Section numbers rather than chunk ids: a reindex gives new ids.
+    """
+    now = time.monotonic()
+    for doc_id in {h.document_id for h in hits if h.unit is None}:
+        numbers: list[int] = []
+        for h in hits:
+            if h.unit is None and h.document_id == doc_id:
+                number = sections[h.id]
+                if number not in numbers:
+                    numbers.append(number)
+        _recent[doc_id] = (now, numbers)
+    for doc_id, (seen, _numbers) in list(_recent.items()):
+        if now - seen > RECENT_SECONDS:
+            del _recent[doc_id]
 
 
 def _cap(text: str, limit: int, offset: int = 0) -> tuple[str, int]:
@@ -96,6 +168,8 @@ def _knowledge_search(args: dict):
         as_of=args.get("as_of"))
     max_chars = args.get("max_chars", MAX_HIT_CHARS)
 
+    sections = _section_index(conn, hits)
+
     # A Hit has no source, so one lookup covers every hit.
     sources: dict[str, str] = {}
     if hits:
@@ -113,9 +187,15 @@ def _knowledge_search(args: dict):
             emit(conn, "security.injection", document=h.document_id, path=h.path, rules=fired)
         text, withheld = _cap(text, max_chars)
         hit = dataclasses.replace(h, text=text).as_dict(withheld)
+        if h.unit is None:
+            # Set after as_dict, which drops falsy values: section 0 is real.
+            hit["section"] = sections[h.id]
         if kb.readonly_hint(sources.get(h.document_id, "native")) is not None:
             hit["writable"] = False
         out.append(hit)
+
+    if _remembering:
+        _remember(hits, sections)
 
     # The query is user text, so it passes through the same redaction as other output.
     query_text, _ = redact(args["q"])
@@ -126,27 +206,80 @@ def _knowledge_search(args: dict):
     return out
 
 
+def _matched_sections(doc_id: str, secs: list) -> list[dict]:
+    """The sections this session's last search of the document hit, in rank order."""
+    entry = _recent.get(doc_id)
+    if not _remembering or entry is None or time.monotonic() - entry[0] > RECENT_SECONDS:
+        return []
+    by_number = {s.number: s for s in secs}
+    matched: list[dict] = []
+    used = 0
+    for number in entry[1]:
+        section = by_number.get(number)
+        # Section 0 is the opening, which the outline response already carries as text.
+        if number == 0 or section is None:
+            continue
+        if used >= MATCHED_CHARS:
+            break
+        piece, withheld = _cap(section.text, MATCHED_CHARS - used)
+        item = {"section": number, "heading": section.heading, "text": piece}
+        if withheld:
+            item["withheld_chars"] = withheld
+        matched.append(item)
+        used += len(piece)
+    return matched
+
+
 def _knowledge_get(args: dict):
-    _at_least(args, "offset", 0, low=0)
     conn, cfg = _ctx()
     row = conn.execute("SELECT * FROM documents WHERE id = ?", (args["id"],)).fetchone()
     if row is None:
         return {"error": kb.unknown_document_message(args["id"])}
-    text = Path(row["path"]).read_text()
-    # Indexing redacts the chunks; the file itself must not be a way around that. Applied
-    # on the way out only, so the user's own notes are never rewritten.
-    redacted: list[str] = []
-    if cfg.scan_secrets:
-        text, redacted = redact(text)
-    text, fired = scrub_injection(text)
+    text, redacted, fired = kb.readable(row["path"], cfg)
     if fired:
         emit(conn, "security.injection", document=row["id"], path=row["path"], rules=fired)
-    # Redaction runs on the whole text before the window is taken: after the cut, a secret
-    # could straddle the boundary and escape.
-    offset = args.get("offset", 0)
-    text, withheld = _cap(text, args.get("max_chars", MAX_DOC_CHARS), offset)
-    result = {"id": row["id"], "title": row["title"], "path": row["path"],
-              "status": row["status"], "text": text}
+    explicit = args.get("max_chars") is not None or args.get("offset") is not None
+    max_chars = MAX_DOC_CHARS if args.get("max_chars") is None else _at_least(
+        args, "max_chars", MAX_DOC_CHARS)
+    offset = 0 if args.get("offset") is None else _at_least(args, "offset", 0, low=0)
+    section = args.get("section")
+    secs = sections_of(text)
+    withheld = 0
+    tail_key = None
+
+    if section is not None:
+        if not secs:
+            return {"error": "this document has no sections; omit section to read it"}
+        picked = next((s for s in secs if s.number == section), None)
+        if picked is None:
+            return {"error": f"section {section} not found; this document has "
+                             f"sections {secs[0].number}..{secs[-1].number}"}
+        body, withheld = _cap(picked.text, max_chars, offset)
+        result = {"id": row["id"], "title": row["title"], "path": row["path"],
+                  "status": row["status"], "section": picked.number,
+                  "heading": picked.heading, "text": body}
+        mode = "section"
+    elif not explicit and len(text) > OUTLINE_OVER and any(s.number >= 1 for s in secs):
+        opening = next((s for s in secs if s.number == 0), None)
+        body, _cut = _cap(opening.text if opening else "", OPENING_CHARS)
+        matched = _matched_sections(row["id"], secs)
+        result = {"id": row["id"], "title": row["title"], "path": row["path"],
+                  "status": row["status"], "text": body,
+                  "outline": outline(secs, OUTLINE_CHARS)}
+        if matched:
+            result["sections"] = matched
+        body_len = len(strip_data_uris(read_frontmatter(text)[1]))
+        withheld = max(body_len - len(body) - sum(len(m["text"]) for m in matched), 0)
+        result["withheld_chars"] = withheld
+        tail_key = "Outline only: knowledge_get(id, section=N) for a section's text"
+        mode = "outline"
+    else:
+        body, withheld = _cap(text, max_chars, offset)
+        result = {"id": row["id"], "title": row["title"], "path": row["path"],
+                  "status": row["status"], "text": body}
+        mode = "text"
+
+    # Every mode carries the same extra fields text mode always has.
     for name, value in (("redacted", redacted), ("injection", fired),
                         ("withheld_chars", withheld), ("offset", offset)):
         if value:
@@ -155,8 +288,14 @@ def _knowledge_get(args: dict):
     if hint is not None:
         result["writable"] = False
         result["readonly_hint"] = hint
-    if text:
-        payload = {"document": row["id"], "source": row["source"]}
+    if tail_key is not None:
+        result["next"] = tail_key
+
+    chars = len(result.get("text") or "") + len(result.get("outline") or "")
+    chars += sum(len(s["text"]) for s in result.get("sections") or [])
+    if chars:
+        payload = {"document": row["id"], "source": row["source"], "mode": mode,
+                   "chars": chars}
         if offset:
             payload["offset"] = offset
         emit(conn, "knowledge.read", **payload)
@@ -628,8 +767,9 @@ DESCRIPTIONS = {
         "much was cut. neighbours counts linked documents: when above 0, knowledge_related "
         "may help. as_of (YYYY-MM-DD) answers from what was valid then."),
     "knowledge_get": (
-        "Fetch one document by id, with its path. Long text is paged: pass offset to "
-        "continue where withheld_chars says it stopped."),
+        "Fetch one document by id. Over 8000 chars: its opening, an outline and the "
+        "sections your last search hit; pass section=N for one section, or "
+        "max_chars/offset for raw text."),
     "knowledge_write": (
         "Write a new document. Search first and use knowledge_append on an existing "
         "document rather than writing a near-duplicate. Record the decision rule, the "
@@ -866,9 +1006,13 @@ def build_server():
             "match_mode": match_mode, "max_chars": max_chars, "as_of": as_of}))
 
     @server.tool(description=DESCRIPTIONS["knowledge_get"])
-    def knowledge_get(id: str, max_chars: int = MAX_DOC_CHARS, offset: int = 0) -> str:
+    def knowledge_get(id: str, max_chars: int | None = None, offset: int | None = None,
+                      section: int | None = None) -> str:
         return _json(call_tool("knowledge_get", {
-            "id": id, "max_chars": max_chars, "offset": offset}))
+            "id": id,
+            "max_chars": max_chars,
+            "offset": offset,
+            "section": section}))
 
     @server.tool(description=DESCRIPTIONS["knowledge_write"])
     def knowledge_write(title: str, body: str, repo: str | None = None,
@@ -975,6 +1119,8 @@ def _warm_embedder() -> threading.Thread | None:
 
 def serve() -> None:
     """Run the stdio MCP server."""
+    transport = "stdio"
+    remember_searches(transport)
     server = build_server()
     _warm_embedder()
-    server.run("stdio")
+    server.run(transport)
