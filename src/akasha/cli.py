@@ -195,11 +195,33 @@ def cmd_search(args) -> int:
 
 def cmd_kb_get(args) -> int:
     conn, cfg = _ctx()
-    text = Path(kb.get(conn, args.id)["path"]).read_text()
-    if cfg.scan_secrets:
-        from akasha.security import redact
+    from akasha.mcp_server import OPENING_CHARS, OUTLINE_CHARS, OUTLINE_OVER
+    # The CLI skipped the injection scrub the MCP read applied; one helper closes that.
+    text, _redacted, _fired = kb.readable(kb.get(conn, args.id)["path"], cfg)
+    secs = markdown.sections_of(text)
+    if args.section is not None:
+        if not secs:
+            print("this document has no sections; omit section to read it")
+            return 1
+        picked = next((s for s in secs if s.number == args.section), None)
+        if picked is None:
+            print(f"section {args.section} not found; this document has sections "
+                  f"{secs[0].number}..{secs[-1].number}")
+            return 1
+        return _print_window(picked.text, args)
+    if (args.offset == 0 and args.max_chars is None and len(text) > OUTLINE_OVER
+            and any(s.number >= 1 for s in secs)):
+        opening = next((s for s in secs if s.number == 0), None)
+        print(opening.text[:OPENING_CHARS] if opening else "")
+        print()
+        print(markdown.outline(secs, OUTLINE_CHARS))
+        print(f"Outline only: akasha knowledge get {args.id} --section N for a "
+              f"section's text")
+        return 0
+    return _print_window(text, args)
 
-        text, _ = redact(text)
+
+def _print_window(text: str, args) -> int:
     window = text[args.offset:]
     if args.max_chars is not None and len(window) > args.max_chars:
         print(f"{len(window) - args.max_chars} chars withheld; continue with --offset "
@@ -849,8 +871,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="print hits as JSON")
     p.set_defaults(func=cmd_search)
 
-    p = kb_sub.add_parser("get", help="print one document in full")
+    p = kb_sub.add_parser("get", help="print one document; a long one as an outline")
     p.add_argument("id", help="document to print")
+    p.add_argument("--section", type=int, help="print one section by its outline number")
     p.add_argument("--offset", type=int, default=0, help="first character to print (default 0)")
     p.add_argument("--max-chars", type=int, dest="max_chars",
                    help="print at most this many characters; the rest is reported on stderr")

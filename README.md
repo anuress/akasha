@@ -29,7 +29,8 @@ Agents search it through MCP before they start investigating, and write what the
 back as ordinary markdown with `knowledge_write` and `knowledge_append`. The next
 session starts where the last one ended. Search is keyword (BM25) and, if enabled, dense
 retrieval, fused by reciprocal rank. Results are sized for a context window: a handful of
-capped hits, with `knowledge_get` to page into a document only when one is worth reading.
+capped hits, with `knowledge_get` to get a long document as an outline and then one of its
+sections, only when one is worth reading.
 
 Conventions are documents of `kind=convention`. They are delivered automatically at
 session start and are read-only to agents; only the CLI can create or change one. Hooks
@@ -121,7 +122,7 @@ Fourteen MCP tools:
 | Tool | What it does |
 |---|---|
 | `knowledge_search` | Ranked chunks; current repo first, OR retry when strict finds nothing, `as_of` date |
-| `knowledge_get` | One document by id, paged |
+| `knowledge_get` | One document by id; a long one as an outline plus the sections your search hit, `section=N` for one |
 | `knowledge_write` | New document; lists fold candidates and can supersede older ones |
 | `knowledge_update` | Correct a document in place, whole body or one exact span |
 | `knowledge_append` | Append a dated section to a document |
